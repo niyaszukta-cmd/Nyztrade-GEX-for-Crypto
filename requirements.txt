@@ -1,0 +1,25 @@
+# NYZTrade Crypto GEX Dashboard — Requirements
+# Python 3.10+
+
+# ── Core framework ──────────────────────────────────────────────────────────
+streamlit>=1.32.0
+
+# ── Data & Math ─────────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ── Charting ────────────────────────────────────────────────────────────────
+plotly>=5.18.0
+
+# ── HTTP client (Deribit API calls) ─────────────────────────────────────────
+requests>=2.31.0
+
+# ── Timezone handling ───────────────────────────────────────────────────────
+pytz>=2024.1
+
+# ── Optional: WebSocket streaming (future upgrade) ──────────────────────────
+# websocket-client>=1.7.0
+
+# ── Optional: async support (future upgrade) ────────────────────────────────
+# aiohttp>=3.9.0
