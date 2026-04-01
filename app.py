@@ -267,8 +267,7 @@ def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
     """
     Re-compute Greeks using Black-Scholes for any row where
     gamma or vanna is 0/missing (Deribit sometimes omits these).
-    expiry_str format: 10APR26
-    Uses vectorised pandas operations — no df.at[] to avoid index issues.
+    Uses pure numpy arrays — completely avoids pandas index alignment issues.
     """
     if df.empty:
         return df
@@ -280,69 +279,72 @@ def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
     except Exception:
         tte = 7 / 365.0
 
-    # Ensure all Greek columns exist
-    for col in ['call_gamma','put_gamma','call_vanna','put_vanna',
-                'call_delta','put_delta']:
+    # Ensure Greek columns exist with float dtype
+    for col in ['call_gamma','put_gamma','call_vanna','put_vanna','call_delta','put_delta']:
         if col not in df.columns:
             df[col] = 0.0
+        df[col] = df[col].astype(float)
 
-    # Reset index to ensure clean integer index for vectorised ops
-    df = df.reset_index(drop=True)
+    # Work entirely on numpy arrays — no pandas index issues
+    S   = float(spot_price)
+    T   = float(tte)
+    r   = 0.05
+    K   = df['strike'].to_numpy(dtype=float)
 
-    # IV: use 65% as fallback where missing or near-zero
-    c_iv = df['call_iv'].fillna(65.0).clip(lower=1.0)
-    p_iv = df['put_iv'].fillna(65.0).clip(lower=1.0)
-    c_iv_frac = c_iv / 100.0
-    p_iv_frac = p_iv / 100.0
+    c_iv = np.clip(df['call_iv'].fillna(65.0).to_numpy(dtype=float), 1.0, 500.0) / 100.0
+    p_iv = np.clip(df['put_iv'].fillna(65.0).to_numpy(dtype=float),  1.0, 500.0) / 100.0
 
-    S = spot_price
-    K = df['strike']
-    T = tte
-    r = 0.05
+    sqrtT = np.sqrt(T)
 
-    # Vectorised BS Greeks
-    def _safe_d1(iv_frac):
-        denom = iv_frac * np.sqrt(T)
-        denom = denom.replace(0, 1e-10)
-        return (np.log(S / K) + (r + 0.5 * iv_frac**2) * T) / denom
+    def _d1(iv): return (np.log(S / np.maximum(K, 1e-6)) + (r + 0.5*iv**2)*T) / np.maximum(iv*sqrtT, 1e-10)
+    def _gamma(iv):
+        d1 = _d1(iv)
+        return norm.pdf(d1) / np.maximum(S * iv * sqrtT, 1e-10)
+    def _vanna(iv):
+        d1 = _d1(iv)
+        d2 = d1 - iv * sqrtT
+        return -norm.pdf(d1) * d2 / np.maximum(iv, 1e-10)
+    def _delta_call(iv): return norm.cdf(_d1(iv))
+    def _delta_put(iv):  return norm.cdf(_d1(iv)) - 1.0
 
-    c_d1 = _safe_d1(c_iv_frac)
-    p_d1 = _safe_d1(p_iv_frac)
-    c_d2 = c_d1 - c_iv_frac * np.sqrt(T)
-    p_d2 = p_d1 - p_iv_frac * np.sqrt(T)
+    # Compute BS values as numpy arrays
+    c_gamma_arr = _gamma(c_iv);       p_gamma_arr = _gamma(p_iv)
+    c_vanna_arr = _vanna(c_iv);       p_vanna_arr = _vanna(p_iv)
+    c_delta_arr = _delta_call(c_iv);  p_delta_arr = _delta_put(p_iv)
 
-    # Gamma = pdf(d1) / (S * sigma * sqrt(T))
-    c_gamma_bs = norm.pdf(c_d1) / (S * c_iv_frac * np.sqrt(T))
-    p_gamma_bs = norm.pdf(p_d1) / (S * p_iv_frac * np.sqrt(T))
+    # Get current values as numpy arrays
+    cg = df['call_gamma'].to_numpy(dtype=float)
+    pg = df['put_gamma'].to_numpy(dtype=float)
+    cv = df['call_vanna'].to_numpy(dtype=float)
+    pv = df['put_vanna'].to_numpy(dtype=float)
+    cd = df['call_delta'].to_numpy(dtype=float)
+    pd_ = df['put_delta'].to_numpy(dtype=float)
 
-    # Vanna = -pdf(d1) * d2 / sigma
-    c_vanna_bs = -norm.pdf(c_d1) * c_d2 / c_iv_frac
-    p_vanna_bs = -norm.pdf(p_d1) * p_d2 / p_iv_frac
+    # Replace zeros with BS values using numpy where
+    cg  = np.where(np.abs(cg)  < 1e-12, c_gamma_arr, cg)
+    pg  = np.where(np.abs(pg)  < 1e-12, p_gamma_arr, pg)
+    cv  = np.where(np.abs(cv)  < 1e-12, c_vanna_arr, cv)
+    pv  = np.where(np.abs(pv)  < 1e-12, p_vanna_arr, pv)
+    cd  = np.where(np.abs(cd)  < 1e-12, c_delta_arr, cd)
+    pd_ = np.where(np.abs(pd_) < 1e-12, p_delta_arr, pd_)
 
-    # Delta
-    c_delta_bs = norm.cdf(c_d1)
-    p_delta_bs = norm.cdf(p_d1) - 1.0
+    # Write back as new columns (avoids dtype coercion errors)
+    df = df.copy()
+    df['call_gamma'] = cg
+    df['put_gamma']  = pg
+    df['call_vanna'] = cv
+    df['put_vanna']  = pv
+    df['call_delta'] = cd
+    df['put_delta']  = pd_
 
-    # Only replace zeros — keep broker-provided values where they exist
-    mask_c_gamma = df['call_gamma'].abs() < 1e-12
-    mask_p_gamma = df['put_gamma'].abs() < 1e-12
-    mask_c_vanna = df['call_vanna'].abs() < 1e-12
-    mask_p_vanna = df['put_vanna'].abs() < 1e-12
-    mask_c_delta = df['call_delta'].abs() < 1e-12
-    mask_p_delta = df['put_delta'].abs() < 1e-12
+    # Recompute aggregate metrics
+    c_oi = df['call_oi'].to_numpy(dtype=float)
+    p_oi = df['put_oi'].to_numpy(dtype=float)
+    div  = df.attrs.get('unit_divisor', 1e3)
 
-    df.loc[mask_c_gamma, 'call_gamma'] = c_gamma_bs[mask_c_gamma]
-    df.loc[mask_p_gamma, 'put_gamma']  = p_gamma_bs[mask_p_gamma]
-    df.loc[mask_c_vanna, 'call_vanna'] = c_vanna_bs[mask_c_vanna]
-    df.loc[mask_p_vanna, 'put_vanna']  = p_vanna_bs[mask_p_vanna]
-    df.loc[mask_c_delta, 'call_delta'] = c_delta_bs[mask_c_delta]
-    df.loc[mask_p_delta, 'put_delta']  = p_delta_bs[mask_p_delta]
-
-    # Recompute aggregated metrics with enriched Greeks
-    div = df.attrs.get('unit_divisor', 1e3)
-    df['net_gex']   = (df['call_oi'] * df['call_gamma'] - df['put_oi'] * df['put_gamma']) * S**2 / div
-    df['net_vanna'] = (df['call_oi'] * df['call_vanna'] - df['put_oi'] * df['put_vanna']) / div
-    df['net_dex']   = (df['call_oi'] * df['call_delta'] + df['put_oi'] * df['put_delta']) / div
+    df['net_gex']   = (c_oi * cg  - p_oi * pg)  * S**2 / div
+    df['net_vanna'] = (c_oi * cv  - p_oi * pv)           / div
+    df['net_dex']   = (c_oi * cd  + p_oi * pd_)          / div
 
     return df
 
