@@ -1013,7 +1013,6 @@ def main():
             expiries = st.session_state['expiries']
 
         if not expiries:
-            from datetime import datetime, timedelta
             # Generate next 4 Friday expiries as fallback
             today = datetime.utcnow()
             fallback = []
