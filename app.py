@@ -130,8 +130,12 @@ CRYPTO_CONFIG = {
     'BTC': {
         'contract_size':   1,
         'strike_interval': 1000,
-        'pts_per_unit':    0.00001,   # empirical: ~$100k GEX → ~1pt BTC move
-        'strike_cap_pts':  2000,      # BTC can move big per strike
+        # pts_per_unit derivation:
+        # GEX stored in K (thousands USD after /1e3)
+        # Typical ATM GEX ~27,000K. Typical forced move ~$300
+        # → 300 / 27,000 = 0.011. Use 0.010 (conservative)
+        'pts_per_unit':    0.010,
+        'strike_cap_pts':  2000,      # BTC can move $2000+ per major level
         'currency':        'BTC',
         'unit_label':      'K',       # display in thousands USD
         'unit_divisor':    1e3,
@@ -141,8 +145,10 @@ CRYPTO_CONFIG = {
     'ETH': {
         'contract_size':   1,
         'strike_interval': 50,
-        'pts_per_unit':    0.0001,
-        'strike_cap_pts':  200,
+        # ETH GEX in K. Typical ATM GEX ~5,000K → ~$25 move
+        # → 25 / 5000 = 0.005
+        'pts_per_unit':    0.005,
+        'strike_cap_pts':  200,       # ETH moves ~$200 per major level
         'currency':        'ETH',
         'unit_label':      'K',
         'unit_divisor':    1e3,
@@ -152,7 +158,9 @@ CRYPTO_CONFIG = {
     'XAU': {
         'contract_size':   1,        # 1 troy oz per contract on Deribit
         'strike_interval': 25,       # $25 intervals for gold (ATM ~$3100)
-        'pts_per_unit':    0.002,    # empirical: gold moves ~$2 per 1K GEX
+        # XAU GEX in K. Typical ATM GEX ~500K → ~$5 gold move
+        # → 5 / 500 = 0.010. But gold is less volatile than BTC
+        'pts_per_unit':    0.008,    # empirical: gold moves ~$4 per 500K GEX
         'strike_cap_pts':  50,       # gold max ~$50 per strike cascade
         'currency':        'XAU',
         'unit_label':      'K',
@@ -399,6 +407,126 @@ def get_spot_price(currency: str) -> float:
     # Fallback defaults if API returns 0 (XAU may not have index on all plans)
     _fallbacks = {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}
     return price if price > 0 else _fallbacks.get(currency, 0)
+
+# ============================================================================
+# HISTORICAL DATA (Deribit free tier — settlement prices + last 5 days trades)
+# ============================================================================
+
+def get_deribit_historical_settlement(currency: str, count: int = 10) -> pd.DataFrame:
+    """
+    Fetch historical settlement/expiry data for a currency.
+    Shows how GEX evolved across past expiries.
+    FREE on Deribit — no auth needed.
+    """
+    result = deribit_get("get_delivery_prices", {
+        "index_name": f"{currency.lower()}_usd",
+        "count":      count,
+        "offset":     0,
+    })
+    if not result or 'data' not in result:
+        return pd.DataFrame()
+    rows = []
+    for item in result.get('data', []):
+        rows.append({
+            'date':            item.get('date', ''),
+            'delivery_price':  item.get('delivery_price', 0),
+        })
+    return pd.DataFrame(rows)
+
+
+def get_deribit_historical_iv(currency: str, expiry: str) -> pd.DataFrame:
+    """
+    Reconstruct approximate historical IV snapshot using Deribit
+    historical volatility endpoint (free).
+    Returns 30-day realized vol history.
+    """
+    result = deribit_get("get_historical_volatility", {"currency": currency})
+    if not isinstance(result, list):
+        return pd.DataFrame()
+    rows = []
+    for item in result[-30:]:  # last 30 days
+        if isinstance(item, list) and len(item) >= 2:
+            ts  = datetime.utcfromtimestamp(item[0] / 1000)
+            vol = item[1]
+            rows.append({'timestamp': ts, 'realized_vol': vol})
+    return pd.DataFrame(rows)
+
+
+def create_historical_vol_chart(vol_df: pd.DataFrame,
+                                 currency: str) -> go.Figure:
+    """30-day realized volatility chart."""
+    if vol_df.empty:
+        return go.Figure()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=vol_df['timestamp'], y=vol_df['realized_vol'],
+        mode='lines+markers', name='Realized Vol %',
+        line=dict(color='#f59e0b', width=2),
+        fill='tozeroy', fillcolor='rgba(245,158,11,0.1)',
+        hovertemplate='%{x}<br>Realized Vol: %{y:.1f}%<extra></extra>',
+    ))
+    fig.update_layout(
+        title=f'📉 {currency} 30-Day Realized Volatility History',
+        xaxis_title='Date', yaxis_title='Realized Volatility (%)',
+        height=400, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+    )
+    return fig
+
+
+def create_snapshot_evolution_chart(history: list,
+                                     metric: str = 'net_gex',
+                                     currency: str = 'BTC') -> go.Figure:
+    """
+    Chart showing how a GEX metric evolved across intraday snapshots.
+    This IS the equivalent of the India dashboard intraday timeline.
+    """
+    if len(history) < 2:
+        return go.Figure()
+
+    timestamps = []
+    values     = []
+    spots      = []
+
+    for snap in history:
+        df_snap = snap['df']
+        timestamps.append(snap['ts'])
+        spots.append(snap['spot'])
+        if metric in df_snap.columns:
+            values.append(df_snap[metric].sum())
+        else:
+            values.append(0)
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.6, 0.4],
+                        subplot_titles=[f'{currency} {metric.upper()} Intraday Evolution',
+                                        'Spot Price'])
+    # GEX line
+    colors_bar = ['#10b981' if v >= 0 else '#ef4444' for v in values]
+    fig.add_trace(go.Bar(
+        x=timestamps, y=values,
+        name=metric.upper(), marker_color=colors_bar,
+        hovertemplate='%{x}<br>' + metric + ': %{y:.4f}K<extra></extra>',
+    ), row=1, col=1)
+    fig.add_hline(y=0, line=dict(color='#64748b', width=1), row=1, col=1)
+
+    # Spot price line
+    fig.add_trace(go.Scatter(
+        x=timestamps, y=spots,
+        name='Spot Price', mode='lines+markers',
+        line=dict(color='#fbbf24', width=2),
+        hovertemplate='%{x}<br>Spot: $%{y:,.2f}<extra></extra>',
+    ), row=2, col=1)
+
+    fig.update_layout(
+        height=550, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        showlegend=True,
+    )
+    return fig
+
 
 # ============================================================================
 # PURE ANALYTICS FUNCTIONS
@@ -1037,6 +1165,25 @@ def main():
         refresh_btn = st.button("🔄 Refresh Data", use_container_width=True)
 
         st.markdown("---")
+        st.markdown("### 📸 Intraday Snapshots")
+        st.caption("Each fetch adds a timestamped snapshot. Use slider to replay intraday.")
+        auto_snapshot = st.checkbox("🔄 Auto-snapshot", value=False,
+            help="Automatically capture a snapshot every N minutes")
+        if auto_snapshot:
+            snap_interval = st.slider("Interval (minutes)", 1, 30, 5)
+        else:
+            snap_interval = 5
+        if st.button("📸 Capture Snapshot Now", use_container_width=True):
+            st.session_state['force_snapshot'] = True
+
+        if 'snapshot_history' in st.session_state and st.session_state['snapshot_history']:
+            n_snaps = len(st.session_state['snapshot_history'])
+            st.success(f"📚 {n_snaps} snapshot{'s' if n_snaps > 1 else ''} in memory")
+            if st.button("🗑️ Clear Snapshots", use_container_width=True):
+                st.session_state['snapshot_history'] = []
+                st.rerun()
+
+        st.markdown("---")
         if st.button("🏠 Back to Home", use_container_width=True):
             st.session_state.app_entered = False
             st.rerun()
@@ -1067,11 +1214,86 @@ def main():
             st.session_state['crypto_meta'] = meta
             st.info("Loaded from cache (< 60s old)")
 
+    # ── Snapshot management ───────────────────────────────────────────────────
+    if 'snapshot_history' not in st.session_state:
+        st.session_state['snapshot_history'] = []
+    if 'last_snapshot_time' not in st.session_state:
+        st.session_state['last_snapshot_time'] = None
+
+    # Capture snapshot on fetch, manual trigger, or auto interval
+    should_snapshot = (
+        fetch_btn or
+        st.session_state.pop('force_snapshot', False) or
+        (
+            auto_snapshot and
+            st.session_state.last_snapshot_time is not None and
+            (datetime.utcnow() - st.session_state.last_snapshot_time).total_seconds() >= snap_interval * 60
+        )
+    )
+    if should_snapshot and 'crypto_df' in st.session_state and st.session_state['crypto_df'] is not None:
+        snap_df = st.session_state['crypto_df'].copy()
+        snap_ts = datetime.utcnow()
+        snap_df['snapshot_ts'] = snap_ts
+        # Keep max 48 snapshots (24h at 30min intervals)
+        history = st.session_state['snapshot_history']
+        history.append({'ts': snap_ts, 'df': snap_df, 'spot': spot_price})
+        if len(history) > 48:
+            history = history[-48:]
+        st.session_state['snapshot_history'] = history
+        st.session_state['last_snapshot_time'] = snap_ts
+
+    # Auto-rerun for snapshot polling
+    if auto_snapshot and st.session_state.get('last_snapshot_time') is not None:
+        elapsed = (datetime.utcnow() - st.session_state['last_snapshot_time']).total_seconds()
+        remaining = max(0, int(snap_interval * 60 - elapsed))
+        if remaining > 0:
+            st.sidebar.info(f"⏱️ Next snapshot in: **{remaining}s**")
+        else:
+            st.session_state['force_snapshot'] = True
+            time.sleep(0.5)
+            st.rerun()
+
     # ── Main display ──────────────────────────────────────────────────────────
     if 'crypto_df' in st.session_state and st.session_state['crypto_df'] is not None:
         df   = st.session_state['crypto_df']
         meta = st.session_state['crypto_meta']
         unit_label = meta.get('unit_label', 'K')
+
+        # ── Timestamp slider (if we have snapshots) ───────────────────────────
+        history = st.session_state.get('snapshot_history', [])
+        if len(history) > 1:
+            st.markdown("### ⏱️ Intraday Replay")
+            ts_labels = [h['ts'].strftime('%H:%M:%S UTC') for h in history]
+            selected_snap_idx = st.slider(
+                "Select Snapshot Time",
+                min_value=0,
+                max_value=len(history) - 1,
+                value=len(history) - 1,
+                format="%d",
+                help="Slide to replay intraday GEX evolution",
+            )
+            st.caption(f"Viewing: **{ts_labels[selected_snap_idx]}** | "
+                       f"{selected_snap_idx + 1} of {len(history)} snapshots | "
+                       f"Spot: ${history[selected_snap_idx]['spot']:,.2f}")
+            # Use selected snapshot
+            df        = history[selected_snap_idx]['df']
+            spot_price = history[selected_snap_idx]['spot']
+            if 'enhanced_oi_gex' not in df.columns:
+                df = _compute_enhanced_oi_gex_crypto(df, spot_price, unit_label)
+            # Compute OI change vs previous snapshot for enhanced GEX
+            if selected_snap_idx > 0:
+                prev_df = history[selected_snap_idx - 1]['df']
+                merged  = df.set_index('strike').join(
+                    prev_df.set_index('strike')[['call_oi','put_oi']].rename(
+                        columns={'call_oi':'prev_call_oi','put_oi':'prev_put_oi'}),
+                    how='left')
+                merged['call_oi_change'] = (merged['call_oi'] - merged['prev_call_oi'].fillna(merged['call_oi'])).abs()
+                merged['put_oi_change']  = (merged['put_oi']  - merged['prev_put_oi'].fillna(merged['put_oi'])).abs()
+                df = merged.reset_index()
+                df = _compute_enhanced_oi_gex_crypto(df, spot_price, unit_label)
+            st.markdown("---")
+        elif len(history) == 1:
+            st.info("📸 1 snapshot captured. Fetch again or enable auto-snapshot to build intraday timeline.")
 
         if df.empty:
             st.error("No data available for this expiry. Try another expiry date.")
@@ -1138,6 +1360,8 @@ def main():
             "📐 Cascade Mathematics",
             "📈 IV Smile / Skew",
             "📋 OI Distribution",
+            "📊 Intraday Timeline",
+            "📉 Historical Vol",
             "📁 Data Table",
         ])
 
@@ -1233,6 +1457,27 @@ def main():
                 _render_cascade(enh_cascade, "Enhanced OI GEX", unit_label)
 
             # Combined summary
+            # ── GEX ↔ Price Move Calculator ──────────────────────────────
+            st.markdown("---")
+            st.markdown("#### ⚡ GEX ↔ Price Move Calculator")
+            gex_per_1000 = 1000 / cfg['pts_per_unit']
+            calc_c1, calc_c2, calc_c3 = st.columns(3)
+            calc_c1.metric(
+                f"GEX needed for $1,000 move",
+                f"{gex_per_1000:,.0f}K",
+                help=f"Calibrated for {currency}: {gex_per_1000:,.0f}K GEX release = $1,000 forced move"
+            )
+            calc_c2.metric(
+                f"$ move per 1K GEX released",
+                f"${cfg['pts_per_unit'] * 1000:.2f}",
+                help=f"Each 1K of GEX released → ${cfg['pts_per_unit']*1000:.2f} on {currency}"
+            )
+            calc_c3.metric(
+                "Single-Strike Cap",
+                f"${cfg['strike_cap_pts']:,}",
+                help=f"Max pts contribution per strike for {currency}"
+            )
+
             st.markdown("---")
             st.markdown("##### 🎯 Dealer Flow Bias")
             try:
@@ -1290,8 +1535,113 @@ def main():
             o3.metric("P/C Ratio",      f"{pcr:.2f}")
             o4.metric("Max OI Strike",  f"${max_pain:,.0f}")
 
-        # Tab 6 — Data Table
+        # Tab 6 — Intraday Timeline
         with tabs[6]:
+            st.markdown(f"### 📊 {currency} Intraday GEX Evolution")
+            history = st.session_state.get('snapshot_history', [])
+            if len(history) >= 2:
+                st.markdown("""<div class="spike-legend">
+                This chart shows how <b>Net GEX</b> evolved across your captured snapshots today.<br>
+                Equivalent to the <b>India dashboard intraday timeline</b> — each bar = one fetch/snapshot.<br>
+                Enable <b>Auto-snapshot</b> in the sidebar to build a continuous intraday picture.
+                </div>""", unsafe_allow_html=True)
+
+                metric_choice = st.selectbox(
+                    "Metric to plot",
+                    ['net_gex', 'net_vanna', 'net_dex', 'enhanced_oi_gex'],
+                    format_func=lambda x: {
+                        'net_gex':         '📊 Net GEX',
+                        'net_vanna':       '🌊 Net VANNA',
+                        'net_dex':         '📈 Net DEX',
+                        'enhanced_oi_gex': '🚀 Enhanced OI GEX',
+                    }[x],
+                    key='timeline_metric'
+                )
+                timeline_fig = create_snapshot_evolution_chart(history, metric_choice, currency)
+                st.plotly_chart(timeline_fig, use_container_width=True)
+
+                # Snapshot summary table
+                st.markdown("#### 📋 Snapshot Log")
+                snap_rows = []
+                for i, snap in enumerate(history):
+                    snap_df = snap['df']
+                    snap_rows.append({
+                        'Time (UTC)':   snap['ts'].strftime('%H:%M:%S'),
+                        'Spot ($)':     f"${snap['spot']:,.2f}",
+                        'Net GEX':      f"{snap_df['net_gex'].sum():.4f}K",
+                        'Net VANNA':    f"{snap_df['net_vanna'].sum():.4f}K",
+                        'P/C Ratio':    f"{snap_df['put_oi'].sum() / max(snap_df['call_oi'].sum(),1):.2f}",
+                        'Total OI':     f"{(snap_df['call_oi'].sum() + snap_df['put_oi'].sum()):,.0f}",
+                    })
+                st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "📥 Download Snapshot Log (CSV)",
+                    data=pd.DataFrame(snap_rows).to_csv(index=False),
+                    file_name=f"nyztrade_{currency}_intraday_snapshots.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("""
+                **No intraday timeline yet.**
+
+                To build your intraday picture:
+                1. Click **🚀 Fetch Options Chain** (captures first snapshot)
+                2. Wait a few minutes, then click **🔄 Refresh Data** (captures second snapshot)
+                3. Or enable **🔄 Auto-snapshot** in the sidebar
+
+                After 2+ snapshots, the intraday GEX evolution chart appears here.
+
+                💡 This is the crypto equivalent of the India dashboard's intraday timeline.
+                """)
+
+        # Tab 7 — Historical Volatility
+        with tabs[7]:
+            st.markdown(f"### 📉 {currency} Historical Volatility")
+            st.markdown("""<div class="spike-legend">
+            <b>Realized Volatility</b> = actual price volatility over past 30 days (free from Deribit)<br>
+            Use this to contextualize current IV levels from the IV Smile tab<br>
+            <b>IV > Realized Vol</b> = options expensive, dealers collecting premium (range-bound expected)<br>
+            <b>IV < Realized Vol</b> = options cheap, market underpricing risk (breakout expected)
+            </div>""", unsafe_allow_html=True)
+
+            if st.button("📥 Load Historical Volatility", use_container_width=True, key="load_hist_vol"):
+                with st.spinner(f"Fetching {currency} 30-day realized vol from Deribit..."):
+                    vol_df = get_deribit_historical_iv(currency, selected_expiry)
+                    st.session_state['hist_vol_df'] = vol_df
+
+            if 'hist_vol_df' in st.session_state and not st.session_state['hist_vol_df'].empty:
+                vol_df = st.session_state['hist_vol_df']
+                st.plotly_chart(create_historical_vol_chart(vol_df, currency),
+                                use_container_width=True)
+                current_rv = vol_df['realized_vol'].iloc[-1] if not vol_df.empty else 0
+                avg_iv     = df['call_iv'].mean()
+                hv1, hv2, hv3 = st.columns(3)
+                hv1.metric("Current Realized Vol", f"{current_rv:.1f}%")
+                hv2.metric("Current Avg IV",        f"{avg_iv:.1f}%")
+                hv3.metric("IV Premium",
+                           f"{avg_iv - current_rv:+.1f}%",
+                           delta="Options expensive" if avg_iv > current_rv else "Options cheap",
+                           delta_color="inverse" if avg_iv > current_rv else "normal")
+            else:
+                st.info("Click **Load Historical Volatility** to fetch 30-day realized vol data.")
+
+            # Settlement prices
+            st.markdown("---")
+            st.markdown(f"#### 📅 Past {currency} Expiry Settlement Prices")
+            if st.button("📥 Load Settlement History", use_container_width=True, key="load_settlement"):
+                with st.spinner("Loading settlement prices..."):
+                    settle_df = get_deribit_historical_settlement(currency, 20)
+                    st.session_state['settle_df'] = settle_df
+
+            if 'settle_df' in st.session_state and not st.session_state['settle_df'].empty:
+                settle_df = st.session_state['settle_df']
+                st.dataframe(settle_df, use_container_width=True, hide_index=True)
+                st.caption("Settlement prices = where the market pinned on each expiry date (max pain confirmation)")
+            else:
+                st.info("Click **Load Settlement History** to see past expiry settlement prices.")
+
+        # Tab 8 — Data Table
+        with tabs[8]:
             st.markdown(f"### 📁 {currency} Options Data")
             st.markdown(f"""
             **Asset**: {currency} | **Expiry**: {selected_expiry}
