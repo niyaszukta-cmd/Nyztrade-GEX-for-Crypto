@@ -151,9 +151,9 @@ CRYPTO_CONFIG = {
     },
     'XAU': {
         'contract_size':   1,        # 1 troy oz per contract on Deribit
-        'strike_interval': 50,       # $50 intervals for gold
-        'pts_per_unit':    0.005,
-        'strike_cap_pts':  100,
+        'strike_interval': 25,       # $25 intervals for gold (ATM ~$3100)
+        'pts_per_unit':    0.002,    # empirical: gold moves ~$2 per 1K GEX
+        'strike_cap_pts':  50,       # gold max ~$50 per strike cascade
         'currency':        'XAU',
         'unit_label':      'K',
         'unit_divisor':    1e3,
@@ -204,7 +204,7 @@ def deribit_get(method: str, params: dict = None) -> dict:
             return data['result']
         return {}
     except Exception as e:
-        st.warning(f"Deribit API error ({method}): {e}")
+        # Silently return empty — caller handles missing strikes gracefully
         return {}
 
 
@@ -273,7 +273,7 @@ def fetch_options_chain(currency: str, expiry: str,
         time.sleep(0.05)  # gentle rate limiting
 
         if not call_t and not put_t:
-            continue
+            continue  # Strike doesn't exist for this expiry — skip silently
 
         # Greeks from Deribit (they compute BS Greeks server-side)
         c_greeks = call_t.get('greeks', {})
@@ -330,6 +330,14 @@ def fetch_options_chain(currency: str, expiry: str,
     progress.empty()
 
     if not rows:
+        st.error(
+            f"No option data returned for {currency} {expiry}. "
+            "Possible reasons:\n"
+            "1. Expiry date has already passed — select a future expiry\n"
+            "2. Deribit does not list XAU options (check currency dropdown)\n"
+            "3. Strike range too narrow — try wider ATM range\n"
+            "Tip: For XAU, try BTC or ETH first to confirm connectivity."
+        )
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
@@ -384,10 +392,13 @@ def get_spot_price(currency: str) -> float:
     index_name = {
         'BTC': 'btc_usd',
         'ETH': 'eth_usd',
-        'XAU': 'xau_usd',
+        'XAU': 'xau_usd',  # Deribit uses xau_usd for gold index
     }.get(currency, 'btc_usd')
     result = deribit_get("get_index_price", {"index_name": index_name})
-    return float(result.get('index_price', 0))
+    price = float(result.get('index_price', 0))
+    # Fallback defaults if API returns 0 (XAU may not have index on all plans)
+    _fallbacks = {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}
+    return price if price > 0 else _fallbacks.get(currency, 0)
 
 # ============================================================================
 # PURE ANALYTICS FUNCTIONS
@@ -955,6 +966,12 @@ def main():
             '<div class="crypto-badge">📊 {}</div>'.format(
                 f"Deribit | Contract: {cfg['contract_size']} {currency} | Strike Δ: ${cfg['strike_interval']:,}"),
             unsafe_allow_html=True)
+        if currency == 'XAU':
+            st.info(
+                "🥇 **XAU (Gold) options** are available on Deribit but with limited liquidity. "
+                "If expiries fail to load, try **BTC or ETH** first to confirm your connection is working, "
+                "then switch back to XAU."
+            )
 
         st.markdown("---")
 
@@ -973,9 +990,13 @@ def main():
         if spot_price > 0:
             st.metric(f"{cfg['emoji']} {currency} Spot", f"${spot_price:,.2f}")
         else:
-            spot_price = st.number_input("Manual Spot Price ($)", value=95000.0,
-                                          min_value=1.0, step=100.0)
-
+            # Sensible defaults per asset
+            _default_spots = {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}
+            _step          = {'BTC': 500.0,   'ETH': 10.0,    'XAU': 5.0}
+            spot_price = st.number_input("Manual Spot Price ($)",
+                value=_default_spots.get(currency, 83000.0),
+                min_value=1.0,
+                step=_step.get(currency, 100.0))
         st.markdown("---")
         st.markdown("### 📅 Expiry Selection")
 
@@ -992,8 +1013,17 @@ def main():
             expiries = st.session_state['expiries']
 
         if not expiries:
-            expiries = ['28MAR25', '25APR25', '30MAY25']
-            st.warning("Using example expiries — click Load Expiries")
+            from datetime import datetime, timedelta
+            # Generate next 4 Friday expiries as fallback
+            today = datetime.utcnow()
+            fallback = []
+            d = today
+            while len(fallback) < 4:
+                d += timedelta(days=1)
+                if d.weekday() == 4:  # Friday
+                    fallback.append(d.strftime('%d%b%y').upper())
+            expiries = fallback
+            st.warning("Could not load expiries from Deribit. Using next Fridays as fallback — click Load Expiries to retry.")
 
         selected_expiry = st.selectbox("📆 Expiry", expiries)
 
