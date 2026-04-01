@@ -134,8 +134,8 @@ CRYPTO_CONFIG = {
         # GEX stored in K (thousands USD after /1e3)
         # Typical ATM GEX ~27,000K. Typical forced move ~$300
         # → 300 / 27,000 = 0.011. Use 0.010 (conservative)
-        'pts_per_unit':    0.010,
-        'strike_cap_pts':  2000,      # BTC can move $2000+ per major level
+        'pts_per_unit':    0.007,     # fine-tuned: differentiates mid vs large strikes
+        'strike_cap_pts':  3000,      # raised cap: BTC can move $3000 on dominant strikes
         'currency':        'BTC',
         'unit_label':      'K',       # display in thousands USD
         'unit_divisor':    1e3,
@@ -156,17 +156,20 @@ CRYPTO_CONFIG = {
         'color':           '#6366f1',
     },
     'XAU': {
-        'contract_size':   1,        # 1 troy oz per contract on Deribit
-        'strike_interval': 25,       # $25 intervals for gold (ATM ~$3100)
-        # XAU GEX in K. Typical ATM GEX ~500K → ~$5 gold move
-        # → 5 / 500 = 0.010. But gold is less volatile than BTC
-        'pts_per_unit':    0.008,    # empirical: gold moves ~$4 per 500K GEX
-        'strike_cap_pts':  50,       # gold max ~$50 per strike cascade
+        'contract_size':   1,
+        'strike_interval': 25,       # $25 intervals near $3,100 spot
+        # XAU GEX in K. Typical ATM GEX ~500K → ~$4 gold move
+        'pts_per_unit':    0.008,
+        'strike_cap_pts':  100,
         'currency':        'XAU',
         'unit_label':      'K',
         'unit_divisor':    1e3,
         'emoji':           '🥇',
         'color':           '#fbbf24',
+        # NOTE: Deribit does NOT list XAU options as of 2026
+        # XAU data source = Polygon.io COMEX GC options ($29/month)
+        # Set POLYGON_API_KEY in .streamlit/secrets.toml to enable
+        'data_source':     'POLYGON',
     },
 }
 
@@ -200,6 +203,107 @@ def _load_cache(key: str, max_age: int = 60):
 # ============================================================================
 # DERIBIT API — DATA FETCHER
 # ============================================================================
+
+# ============================================================================
+# BLACK-SCHOLES GREEKS — fallback when broker API doesn't return vanna/gamma
+# ============================================================================
+
+def bs_d1(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Black-Scholes d1."""
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    return (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+
+def bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """BS Gamma = pdf(d1) / (S × sigma × sqrt(T))."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = bs_d1(S, K, T, r, sigma)
+    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+
+def bs_vanna(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """
+    BS Vanna = -pdf(d1) × d2 / sigma
+    = dDelta/dSigma = dVega/dS
+    This is the dealer rehedging force when IV changes.
+    """
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = bs_d1(S, K, T, r, sigma)
+    d2 = d1 - sigma * np.sqrt(T)
+    return -norm.pdf(d1) * d2 / sigma
+
+def bs_delta_call(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return 0.5
+    return norm.cdf(bs_d1(S, K, T, r, sigma))
+
+def bs_delta_put(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0:
+        return -0.5
+    return norm.cdf(bs_d1(S, K, T, r, sigma)) - 1.0
+
+def compute_bs_greeks_for_row(spot: float, strike: float, tte: float,
+                               call_iv: float, put_iv: float,
+                               r: float = 0.05) -> dict:
+    """
+    Compute full BS Greeks for one strike.
+    tte = time to expiry in years (e.g. 7/365 for 1 week)
+    iv  = implied volatility as fraction (0.65 = 65%)
+    """
+    c_iv = max(call_iv / 100.0, 0.01)  # convert % → fraction, floor at 1%
+    p_iv = max(put_iv  / 100.0, 0.01)
+    return {
+        'call_gamma': bs_gamma(spot, strike, tte, r, c_iv),
+        'put_gamma':  bs_gamma(spot, strike, tte, r, p_iv),
+        'call_vanna': bs_vanna(spot, strike, tte, r, c_iv),
+        'put_vanna':  bs_vanna(spot, strike, tte, r, p_iv),
+        'call_delta': bs_delta_call(spot, strike, tte, r, c_iv),
+        'put_delta':  bs_delta_put(spot, strike, tte, r, p_iv),
+    }
+
+def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
+                           expiry_str: str) -> pd.DataFrame:
+    """
+    Re-compute Greeks using Black-Scholes for any row where
+    gamma or vanna is 0/missing (Deribit sometimes omits these).
+    expiry_str format: 10APR26
+    """
+    try:
+        exp_dt = datetime.strptime(expiry_str, '%d%b%y')
+        tte    = max((exp_dt - datetime.utcnow()).days / 365.0, 1/365)
+    except Exception:
+        tte = 7 / 365.0  # default 1 week
+
+    rows_enriched = 0
+    for idx, row in df.iterrows():
+        # Enrich if gamma or vanna is zero/missing
+        needs_enrich = (
+            abs(row.get('call_gamma', 0)) < 1e-12 or
+            abs(row.get('call_vanna', 0)) < 1e-12
+        )
+        if needs_enrich:
+            c_iv = row.get('call_iv', 65.0)
+            p_iv = row.get('put_iv',  65.0)
+            # Use ATM IV as fallback if per-strike IV missing
+            if c_iv < 0.1: c_iv = 65.0
+            if p_iv < 0.1: p_iv = 65.0
+            greeks = compute_bs_greeks_for_row(
+                spot_price, row['strike'], tte, c_iv, p_iv)
+            for col, val in greeks.items():
+                df.at[idx, col] = val
+            rows_enriched += 1
+
+    if rows_enriched > 0:
+        # Recompute net GEX / VANNA / DEX with enriched Greeks
+        cs  = 1  # Deribit contract size = 1
+        div = df.attrs.get('unit_divisor', 1e3)
+        df['net_gex']   = (df['call_oi'] * df['call_gamma'] - df['put_oi'] * df['put_gamma']) * spot_price**2 * cs / div
+        df['net_vanna'] = (df['call_oi'] * df['call_vanna'] - df['put_oi'] * df['put_vanna']) * cs / div
+        df['net_dex']   = (df['call_oi'] * df['call_delta'] + df['put_oi'] * df['put_delta']) * cs / div
+
+    return df
+
 
 def deribit_get(method: str, params: dict = None) -> dict:
     """Generic Deribit public API call — no authentication needed."""
@@ -257,6 +361,30 @@ def fetch_options_chain(currency: str, expiry: str,
         spot_price, timestamp
     """
     cfg = CRYPTO_CONFIG[currency]
+
+    # Route XAU to Polygon.io (Deribit does not list XAU options)
+    if currency == 'XAU':
+        api_key = get_polygon_api_key()
+        if not api_key:
+            st.error(
+                "🥇 **XAU (Gold) options require Polygon.io API key.**\n\n"
+                "Deribit does not list XAU options. COMEX Gold options are available via Polygon.io:\n\n"
+                "1. Sign up FREE at **https://polygon.io** (takes 2 minutes)\n"
+                "2. Copy your API key from the dashboard\n"
+                "3. Add to `.streamlit/secrets.toml`:\n"
+                "```\nPOLYGON_API_KEY = \"your_key_here\"\n```\n"
+                "4. Free tier gives limited calls. **Starter plan = $29/month** for full chain.\n\n"
+                "For now, try **BTC or ETH** to explore the dashboard."
+            )
+            return pd.DataFrame()
+        # Convert expiry format: 04APR26 → 2026-04-04
+        try:
+            exp_dt      = datetime.strptime(expiry, '%d%b%y')
+            expiry_date = exp_dt.strftime('%Y-%m-%d')
+        except Exception:
+            expiry_date = expiry
+        return get_polygon_gold_snapshot(spot_price, expiry_date, atm_range)
+
     strike_interval = cfg['strike_interval']
 
     # Build ATM strike range
@@ -349,6 +477,10 @@ def fetch_options_chain(currency: str, expiry: str,
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
+    # Store unit_divisor for BS enrichment
+    df.attrs['unit_divisor'] = cfg['unit_divisor']
+    # Enrich zeros/missing Greeks with Black-Scholes (handles Deribit missing vanna)
+    df = enrich_greeks_with_bs(df, spot_price, expiry)
     df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
     return df
 
@@ -392,6 +524,105 @@ def _compute_enhanced_oi_gex_crypto(df: pd.DataFrame,
             if (call_enh + put_enh).abs().mean() > 0 else 1
 
     df['enhanced_oi_gex'] = (call_enh - put_enh) * scale
+    return df
+
+
+# ============================================================================
+# POLYGON.IO — COMEX GOLD (XAU) OPTIONS
+# Free tier: 5 API calls/min. Starter: $29/month for full options chain.
+# Sign up: https://polygon.io (free account → get API key immediately)
+# Add to .streamlit/secrets.toml: POLYGON_API_KEY = "your_key_here"
+# ============================================================================
+
+POLYGON_BASE = "https://api.polygon.io"
+
+def get_polygon_api_key() -> str:
+    """Retrieve Polygon API key from Streamlit secrets."""
+    try:
+        return st.secrets.get("POLYGON_API_KEY", "")
+    except Exception:
+        return ""
+
+def get_polygon_gold_snapshot(spot_price: float, expiry_date: str,
+                               atm_range: int = 12) -> pd.DataFrame:
+    """
+    Fetch COMEX Gold (GC) options chain from Polygon.io.
+    expiry_date format: YYYY-MM-DD
+    Requires POLYGON_API_KEY in secrets.toml.
+    Free tier: limited calls. Starter ($29/month): full chain.
+    """
+    api_key = get_polygon_api_key()
+    if not api_key:
+        return pd.DataFrame()
+
+    cfg            = CRYPTO_CONFIG['XAU']
+    strike_interval = cfg['strike_interval']
+    atm_strike     = round(spot_price / strike_interval) * strike_interval
+    strikes        = [atm_strike + i * strike_interval
+                      for i in range(-atm_range, atm_range + 1)]
+    rows = []
+    progress = st.progress(0, text="Fetching COMEX Gold options from Polygon.io...")
+
+    for idx, strike in enumerate(strikes):
+        progress.progress((idx + 1) / len(strikes),
+                          text=f"Fetching gold strike ${strike:,.0f}...")
+        for opt_type, side in [('C','call'), ('P','put')]:
+            # Polygon option symbol format: O:GC{YYMMDD}{C/P}{strike*1000:08d}
+            exp_fmt = datetime.strptime(expiry_date, '%Y-%m-%d').strftime('%y%m%d')
+            symbol  = f"O:GC{exp_fmt}{opt_type}{int(strike * 1000):08d}"
+            try:
+                r = requests.get(
+                    f"{POLYGON_BASE}/v2/snapshot/options/{symbol}",
+                    params={"apiKey": api_key}, timeout=10)
+                if r.status_code != 200:
+                    continue
+                data   = r.json().get('results', {})
+                greeks = data.get('greeks', {})
+                detail = data.get('details', {})
+                day    = data.get('day', {})
+                if side == 'call':
+                    rows.append({
+                        'strike':     strike,
+                        'call_oi':    day.get('open_interest', 0),
+                        'call_volume':day.get('volume', 0),
+                        'call_iv':    data.get('implied_volatility', 0) * 100,
+                        'call_delta': greeks.get('delta', 0),
+                        'call_gamma': greeks.get('gamma', 0),
+                        'call_vanna': greeks.get('vanna', 0),
+                        'put_oi':     0, 'put_volume': 0, 'put_iv': 0,
+                        'put_delta':  0, 'put_gamma': 0, 'put_vanna': 0,
+                    })
+                else:
+                    # Merge put data into existing row for this strike
+                    for row in rows:
+                        if row['strike'] == strike:
+                            row['put_oi']     = day.get('open_interest', 0)
+                            row['put_volume'] = day.get('volume', 0)
+                            row['put_iv']     = data.get('implied_volatility', 0) * 100
+                            row['put_delta']  = greeks.get('delta', 0)
+                            row['put_gamma']  = greeks.get('gamma', 0)
+                            row['put_vanna']  = greeks.get('vanna', 0)
+                            break
+            except Exception:
+                continue
+        time.sleep(0.12)  # Polygon free: 5 calls/min
+
+    progress.empty()
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Compute GEX/VANNA/DEX same as Deribit
+    unit_div = cfg['unit_divisor']
+    df['net_gex']   = (df['call_oi'] * df['call_gamma'] - df['put_oi'] * df['put_gamma']) * spot_price**2 / unit_div
+    df['net_vanna'] = (df['call_oi'] * df['call_vanna'] - df['put_oi'] * df['put_vanna']) / unit_div
+    df['net_dex']   = (df['call_oi'] * df['call_delta'] + df['put_oi'] * df['put_delta']) / unit_div
+    df['total_volume']    = df['call_volume'] + df['put_volume']
+    df['call_oi_change']  = 0.0
+    df['put_oi_change']   = 0.0
+    df['spot_price']      = spot_price
+    df['timestamp']       = datetime.utcnow().replace(tzinfo=pytz.utc)
+    df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
     return df
 
 
@@ -856,6 +1087,155 @@ def create_oi_chart(df: pd.DataFrame, spot_price: float,
     return fig
 
 
+def create_enhanced_vanna_overlay_chart(df: pd.DataFrame, spot_price: float,
+                                         unit_label: str = 'K',
+                                         symbol: str = 'BTC') -> go.Figure:
+    """
+    Enhanced VANNA Overlay — same as India dashboard Tab 5.
+    Shows: Original VANNA bars + Enhanced OI VANNA bars + Volume overlay
+    + VANNA flip zones (Vacuum, Support, Trap Door, Resistance)
+    + Spot line + IV regime annotation
+    """
+    df_s = df.sort_values('strike').reset_index(drop=True)
+    vanna_zones = identify_vanna_flip_zones(df_s, spot_price)
+    iv_df       = compute_iv_trend(df)
+    iv_regime   = 'FLAT'
+    iv_skew     = 0.0
+    if not iv_df.empty and 'iv_regime' in iv_df.columns:
+        last       = iv_df.iloc[-1]
+        iv_regime  = str(last.get('iv_regime', 'FLAT'))
+        iv_skew    = float(last.get('iv_skew', 0.0))
+
+    iv_color = {'EXPANDING':'#ef4444','COMPRESSING':'#10b981','FLAT':'#94a3b8'}.get(iv_regime,'#94a3b8')
+    max_orig  = df_s['net_vanna'].abs().max() or 1
+    max_enh   = df_s['enhanced_oi_gex'].abs().max() or 1  # proxy for enhanced vanna
+
+    # Compute Enhanced OI VANNA (similar to India dashboard)
+    dist     = (df_s['strike'] - spot_price).abs()
+    max_dist = dist.max() or 1
+    dist_w   = 1 - (dist / max_dist) * 0.5
+    avg_iv   = (df_s['call_iv'].fillna(65) + df_s['put_iv'].fillna(65)) / 2
+    iv_mean  = avg_iv.mean() or 65
+    iv_adj   = (avg_iv / iv_mean).clip(0.5, 2.0)
+    vol_mean = df_s['total_volume'].replace(0, np.nan).mean() or 1
+    vol_w    = (df_s['total_volume'].fillna(0) / vol_mean).clip(0.1, 3.0)
+    enh_call = df_s['call_oi'].fillna(0) * df_s['call_vanna'].abs().fillna(0) * vol_w * iv_adj * dist_w
+    enh_put  = df_s['put_oi'].fillna(0)  * df_s['put_vanna'].abs().fillna(0)  * vol_w * iv_adj * dist_w
+    scale    = max_orig / (enh_call + enh_put).abs().mean() if (enh_call + enh_put).abs().mean() > 0 else 1
+    enh_vanna = (enh_call - enh_put) * scale
+
+    role_colors = {
+        'RESISTANCE_CEILING': '#ef4444',
+        'VACUUM_ZONE':        '#10b981',
+        'TRAP_DOOR':          '#f59e0b',
+        'SUPPORT_FLOOR':      '#06b6d4',
+    }
+    role_icons = {
+        'RESISTANCE_CEILING': '🔴',
+        'VACUUM_ZONE':        '🚀',
+        'TRAP_DOOR':          '⚠️',
+        'SUPPORT_FLOOR':      '🛡️',
+    }
+
+    fig = go.Figure()
+
+    # Original VANNA — cyan/teal bars
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['net_vanna'],
+        orientation='h', name=f'Original VANNA — Max: {max_orig:.4f}{unit_label}',
+        marker=dict(
+            color=['rgba(6,182,212,0.65)' if v >= 0 else 'rgba(20,184,166,0.65)'
+                   for v in df_s['net_vanna']],
+            line=dict(width=0),
+        ),
+        hovertemplate='Strike: %{y:,.0f}<br>VANNA: %{x:.4f}' + unit_label + '<extra></extra>',
+    ))
+
+    # Enhanced OI VANNA — pink/magenta bars (narrow overlay)
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=enh_vanna,
+        orientation='h',
+        name=f'Enhanced OI VANNA — Max: {enh_vanna.abs().max():.4f}{unit_label}',
+        marker=dict(
+            color=['rgba(236,72,153,0.80)' if v >= 0 else 'rgba(190,24,93,0.80)'
+                   for v in enh_vanna],
+            line=dict(width=0),
+        ),
+        width=0.35,
+        hovertemplate='Strike: %{y:,.0f}<br>Enh VANNA: %{x:.4f}' + unit_label + '<extra></extra>',
+    ))
+
+    # Volume overlay — call volume (green, right axis)
+    if 'call_volume' in df_s.columns:
+        fig.add_trace(go.Bar(
+            y=df_s['strike'], x=df_s['call_volume'].fillna(0),
+            orientation='h', name='Call Volume',
+            marker=dict(color='rgba(16,185,129,0.18)', line=dict(width=0)),
+            xaxis='x2', showlegend=True,
+        ))
+        fig.add_trace(go.Bar(
+            y=df_s['strike'], x=df_s['put_volume'].fillna(0),
+            orientation='h', name='Put Volume',
+            marker=dict(color='rgba(239,68,68,0.18)', line=dict(width=0)),
+            xaxis='x2', showlegend=True,
+        ))
+
+    # Spot line
+    fig.add_hline(y=spot_price,
+                  line=dict(color='#fbbf24', width=2.5, dash='dash'),
+                  annotation_text=f'Spot: {spot_price:,.2f}',
+                  annotation_font=dict(color='#fbbf24', size=12))
+
+    # VANNA flip zone lines
+    for vz in vanna_zones:
+        fig.add_hline(
+            y=vz['strike'],
+            line=dict(color=role_colors[vz['role']], width=2, dash='dot'),
+            annotation_text=(
+                role_icons[vz['role']] + ' ' +
+                f"{vz['strike']:,.0f} · {vz['role'].replace('_',' ')}"
+            ),
+            annotation_font=dict(color=role_colors[vz['role']], size=11),
+            annotation_position='right',
+        )
+
+    max_vol = max(df_s['call_volume'].max() if 'call_volume' in df_s.columns else 1, 1)
+    fig.update_layout(
+        title=(
+            f'🌊 {symbol} Enhanced VANNA Overlay | '
+            f'IV: <span style="color:{iv_color}">{iv_regime}</span> | '
+            f'Skew: {iv_skew:+.1f}%'
+        ),
+        xaxis=dict(title=f'Net VANNA ({unit_label})', zeroline=True,
+                   zerolinecolor='#475569', zerolinewidth=1),
+        xaxis2=dict(overlaying='x', side='top', title='Volume',
+                    range=[0, max_vol * 5], showgrid=False,
+                    tickfont=dict(size=9, color='rgba(148,163,184,0.5)'),
+                    title_font=dict(size=10, color='rgba(148,163,184,0.5)')),
+        yaxis_title='Strike Price (USD)',
+        barmode='overlay',
+        height=700, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        legend=dict(
+            x=0.01, y=0.99, bgcolor='rgba(15,23,42,0.7)',
+            bordercolor='#2d3748', borderwidth=1,
+            font=dict(size=10),
+        ),
+        annotations=[dict(
+            x=0.01, y=0.01, xref='paper', yref='paper',
+            text=(
+                'Cyan/Teal = All VANNA effects | '
+                'Pink/Magenta = OI &Delta; with Vol+IV+Distance+VANNA | '
+                '&#x1F7E9;&#x1F7E5; = Volume'
+            ),
+            font=dict(size=9, color='#64748b'),
+            showarrow=False,
+        )],
+    )
+    return fig
+
+
 def create_iv_smile_chart(df: pd.DataFrame, spot_price: float,
                            symbol: str = 'BTC') -> go.Figure:
     """IV Smile / Skew chart — unique to crypto, very informative."""
@@ -1090,16 +1470,28 @@ def main():
                                  format_func=lambda x: {"BTC":"₿ Bitcoin","ETH":"🔷 Ethereum","XAU":"🥇 Gold (XAU)"}[x])
         cfg = CRYPTO_CONFIG[currency]
 
+        # Clear cached data when user switches asset
+        if st.session_state.get('last_currency') != currency:
+            for key in ['crypto_df','crypto_meta','snapshot_history',
+                        'last_snapshot_time','hist_vol_df','settle_df']:
+                st.session_state.pop(key, None)
+            st.session_state['last_currency'] = currency
+
         st.markdown(
             '<div class="crypto-badge">📊 {}</div>'.format(
                 f"Deribit | Contract: {cfg['contract_size']} {currency} | Strike Δ: ${cfg['strike_interval']:,}"),
             unsafe_allow_html=True)
         if currency == 'XAU':
-            st.info(
-                "🥇 **XAU (Gold) options** are available on Deribit but with limited liquidity. "
-                "If expiries fail to load, try **BTC or ETH** first to confirm your connection is working, "
-                "then switch back to XAU."
-            )
+            api_key = get_polygon_api_key()
+            if api_key:
+                st.success("✅ Polygon.io API key detected — XAU (COMEX Gold) ready!")
+            else:
+                st.warning(
+                    "🥇 **XAU needs Polygon.io API key.**\n"
+                    "Deribit does not list XAU options.\n"
+                    "Add `POLYGON_API_KEY` to secrets.toml.\n"
+                    "Free signup: https://polygon.io"
+                )
 
         st.markdown("---")
 
@@ -1131,26 +1523,48 @@ def main():
         if st.button("🔄 Load Expiries"):
             st.session_state.pop('expiries', None)
 
-        if 'expiries' not in st.session_state or \
-           st.session_state.get('expiry_currency') != currency:
-            with st.spinner("Loading expiries..."):
-                expiries = get_deribit_expiries(currency)
-                st.session_state['expiries']        = expiries
-                st.session_state['expiry_currency'] = currency
-        else:
-            expiries = st.session_state['expiries']
-
-        if not expiries:
-            # Generate next 4 Friday expiries as fallback
+        if currency == 'XAU':
+            # XAU uses Polygon.io — generate standard COMEX monthly expiries
+            st.info("🥇 XAU uses Polygon.io (COMEX). Select expiry below.")
             today = datetime.utcnow()
-            fallback = []
-            d = today
-            while len(fallback) < 4:
-                d += timedelta(days=1)
-                if d.weekday() == 4:  # Friday
-                    fallback.append(d.strftime('%d%b%y').upper())
-            expiries = fallback
-            st.warning("Could not load expiries from Deribit. Using next Fridays as fallback — click Load Expiries to retry.")
+            # COMEX Gold options: monthly expiries on 3rd Friday
+            xau_expiries = []
+            for m in range(0, 6):
+                # First day of month offset
+                month_dt = (today.replace(day=1) + timedelta(days=32*m)).replace(day=1)
+                # Find 3rd Friday
+                fridays = 0
+                d = month_dt
+                while fridays < 3:
+                    if d.weekday() == 4:
+                        fridays += 1
+                    if fridays < 3:
+                        d += timedelta(days=1)
+                if d > today:
+                    xau_expiries.append(d.strftime('%d%b%y').upper())
+            expiries = xau_expiries if xau_expiries else ['18APR26','16MAY26','20JUN26']
+            st.session_state['expiries']        = expiries
+            st.session_state['expiry_currency'] = currency
+        else:
+            if 'expiries' not in st.session_state or \
+               st.session_state.get('expiry_currency') != currency:
+                with st.spinner("Loading expiries..."):
+                    expiries = get_deribit_expiries(currency)
+                    st.session_state['expiries']        = expiries
+                    st.session_state['expiry_currency'] = currency
+            else:
+                expiries = st.session_state['expiries']
+
+            if not expiries:
+                today = datetime.utcnow()
+                fallback = []
+                d = today
+                while len(fallback) < 4:
+                    d += timedelta(days=1)
+                    if d.weekday() == 4:
+                        fallback.append(d.strftime('%d%b%y').upper())
+                expiries = fallback
+                st.warning("Could not load expiries from Deribit. Using next Fridays as fallback — click Load Expiries to retry.")
 
         selected_expiry = st.selectbox("📆 Expiry", expiries)
 
@@ -1388,23 +1802,86 @@ def main():
             g2.metric("🟡 Negative OI GEX", f"{df['enhanced_oi_gex'].clip(upper=0).sum():.4f}{unit_label}")
             g3.metric("⚡ Net Enhanced GEX", f"{df['enhanced_oi_gex'].sum():.4f}{unit_label}")
 
-        # Tab 2 — VANNA
+        # Tab 2 — Enhanced VANNA Overlay
         with tabs[2]:
-            st.markdown(f"### 🌊 {currency} VANNA Exposure")
+            st.markdown(f"### 🌊 {currency} Enhanced VANNA Overlay")
             st.markdown("""<div class="spike-legend">
             🔴 <b style="color:#ef4444">Resistance Ceiling</b> = POS→NEG flip above spot — IV↑ forces dealers to SELL delta<br>
             🚀 <b style="color:#10b981">Vacuum Zone</b> = NEG→POS flip above spot — IV↑ forces dealers to BUY delta<br>
             ⚠️ <b style="color:#f59e0b">Trap Door</b> = POS→NEG flip below spot — drop accelerates<br>
-            🛡️ <b style="color:#06b6d4">Support Floor</b> = NEG→POS flip below spot — IV compression holds price
+            🛡️ <b style="color:#06b6d4">Support Floor</b> = NEG→POS flip below spot — IV compression holds price<br>
+            <b>Cyan/Teal</b> = Total VANNA (all OI) &nbsp;|&nbsp;
+            <b style="color:#ec4899">Pink/Magenta</b> = Enhanced OI VANNA (fresh positioning) &nbsp;|&nbsp;
+            <b>Green/Red bars</b> = Volume confirmation
             </div>""", unsafe_allow_html=True)
-            st.plotly_chart(create_vanna_chart(df, spot_price, unit_label, currency),
-                            use_container_width=True)
+
+            # Enhanced VANNA Overlay — same as India dashboard Tab 5
+            enh_vanna_fig = create_enhanced_vanna_overlay_chart(
+                df, spot_price, unit_label, currency)
+            st.plotly_chart(enh_vanna_fig, use_container_width=True)
+
+            # VANNA zone metrics
             vanna_zones = identify_vanna_flip_zones(df, spot_price)
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric("Total VANNA Zones",  len(vanna_zones))
-            v2.metric("🚀 Vacuum Zones",    sum(1 for z in vanna_zones if z['role']=='VACUUM_ZONE'))
-            v3.metric("🔴 Resistance",       sum(1 for z in vanna_zones if z['role']=='RESISTANCE_CEILING'))
-            v4.metric("⚠️ Trap Doors",       sum(1 for z in vanna_zones if z['role']=='TRAP_DOOR'))
+            v1, v2, v3, v4, v5 = st.columns(5)
+            v1.metric("Total Zones",      len(vanna_zones))
+            v2.metric("🚀 Vacuum",        sum(1 for z in vanna_zones if z['role']=='VACUUM_ZONE'))
+            v3.metric("🔴 Resistance",    sum(1 for z in vanna_zones if z['role']=='RESISTANCE_CEILING'))
+            v4.metric("⚠️ Trap Doors",    sum(1 for z in vanna_zones if z['role']=='TRAP_DOOR'))
+            v5.metric("🛡️ Support Floors",sum(1 for z in vanna_zones if z['role']=='SUPPORT_FLOOR'))
+
+            # Zone table
+            if vanna_zones:
+                st.markdown("#### 📋 VANNA Flip Zones — Support & Resistance Map")
+                zone_rows = []
+                for z in sorted(vanna_zones, key=lambda x: x['strike'], reverse=True):
+                    dist_pct = abs(z['strike'] - spot_price) / spot_price * 100
+                    above    = z['strike'] > spot_price
+                    zone_rows.append({
+                        'Strike':    f"${z['strike']:,.0f}",
+                        'Role':      z['role'].replace('_',' '),
+                        'Position':  'Above Spot' if above else 'Below Spot',
+                        'Dist %':    f"{dist_pct:.2f}%",
+                        'Type':      'POS→NEG' if z['pos2neg'] else 'NEG→POS',
+                    })
+                zone_df = pd.DataFrame(zone_rows)
+
+                def _color_zones(row):
+                    role = row.get('Role','')
+                    if 'VACUUM'      in role: return ['background-color:rgba(16,185,129,0.12)']*len(row)
+                    if 'RESISTANCE'  in role: return ['background-color:rgba(239,68,68,0.12)']*len(row)
+                    if 'TRAP'        in role: return ['background-color:rgba(245,158,11,0.12)']*len(row)
+                    if 'SUPPORT'     in role: return ['background-color:rgba(6,182,212,0.12)']*len(row)
+                    return ['']*len(row)
+
+                st.dataframe(zone_df.style.apply(_color_zones, axis=1),
+                             use_container_width=True, hide_index=True)
+
+                # Key levels summary
+                st.markdown("#### 🎯 Key Support & Resistance Levels")
+                nearest_above = [z for z in vanna_zones if z['strike'] > spot_price]
+                nearest_below = [z for z in vanna_zones if z['strike'] <= spot_price]
+                nearest_above = sorted(nearest_above, key=lambda x: x['strike'])
+                nearest_below = sorted(nearest_below, key=lambda x: x['strike'], reverse=True)
+
+                ka1, ka2 = st.columns(2)
+                with ka1:
+                    st.markdown("**⬆️ Nearest Above Spot:**")
+                    for z in nearest_above[:3]:
+                        icon = {'VACUUM_ZONE':'🚀','RESISTANCE_CEILING':'🔴',
+                                'TRAP_DOOR':'⚠️','SUPPORT_FLOOR':'🛡️'}.get(z['role'],'📍')
+                        st.markdown(
+                            f"&nbsp;&nbsp;{icon} **${z['strike']:,.0f}** — "
+                            f"{z['role'].replace('_',' ')} "
+                            f"({abs(z['strike']-spot_price)/spot_price*100:.1f}% away)")
+                with ka2:
+                    st.markdown("**⬇️ Nearest Below Spot:**")
+                    for z in nearest_below[:3]:
+                        icon = {'VACUUM_ZONE':'🚀','RESISTANCE_CEILING':'🔴',
+                                'TRAP_DOOR':'⚠️','SUPPORT_FLOOR':'🛡️'}.get(z['role'],'📍')
+                        st.markdown(
+                            f"&nbsp;&nbsp;{icon} **${z['strike']:,.0f}** — "
+                            f"{z['role'].replace('_',' ')} "
+                            f"({abs(z['strike']-spot_price)/spot_price*100:.1f}% away)")
 
         # Tab 3 — Cascade Mathematics
         with tabs[3]:
