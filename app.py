@@ -123,21 +123,18 @@ st.markdown("""
 #   DERIBIT_CLIENT_SECRET = "your_client_secret"
 # ============================================================================
 
-DERIBIT_BASE = "https://www.deribit.com/api/v2"
+DELTA_BASE = "https://api.india.delta.exchange"
 
-# ── Contract Specs (equivalent to INDEX_CONFIG in India dashboard) ──────────
+# ── Contract Specs ──────────────────────────────────────────────────────────
 CRYPTO_CONFIG = {
     'BTC': {
         'contract_size':   1,
         'strike_interval': 1000,
-        # pts_per_unit derivation:
-        # GEX stored in K (thousands USD after /1e3)
-        # Typical ATM GEX ~27,000K. Typical forced move ~$300
-        # → 300 / 27,000 = 0.011. Use 0.010 (conservative)
-        'pts_per_unit':    0.007,     # fine-tuned: differentiates mid vs large strikes
-        'strike_cap_pts':  3000,      # raised cap: BTC can move $3000 on dominant strikes
+        'pts_per_unit':    0.007,
+        'strike_cap_pts':  3000,
         'currency':        'BTC',
-        'unit_label':      'K',       # display in thousands USD
+        'delta_symbol':    'BTCUSD',   # Delta Exchange ticker symbol
+        'unit_label':      'K',
         'unit_divisor':    1e3,
         'emoji':           '₿',
         'color':           '#f59e0b',
@@ -145,11 +142,10 @@ CRYPTO_CONFIG = {
     'ETH': {
         'contract_size':   1,
         'strike_interval': 50,
-        # ETH GEX in K. Typical ATM GEX ~5,000K → ~$25 move
-        # → 25 / 5000 = 0.005
         'pts_per_unit':    0.005,
-        'strike_cap_pts':  200,       # ETH moves ~$200 per major level
+        'strike_cap_pts':  200,
         'currency':        'ETH',
+        'delta_symbol':    'ETHUSD',
         'unit_label':      'K',
         'unit_divisor':    1e3,
         'emoji':           '🔷',
@@ -157,19 +153,16 @@ CRYPTO_CONFIG = {
     },
     'XAU': {
         'contract_size':   1,
-        'strike_interval': 25,       # $25 intervals near $3,100 spot
-        # XAU GEX in K. Typical ATM GEX ~500K → ~$4 gold move
+        'strike_interval': 25,
         'pts_per_unit':    0.008,
         'strike_cap_pts':  100,
         'currency':        'XAU',
+        'delta_symbol':    'XAUUSD',
         'unit_label':      'K',
         'unit_divisor':    1e3,
         'emoji':           '🥇',
         'color':           '#fbbf24',
-        # NOTE: Deribit does NOT list XAU options as of 2026
-        # XAU data source = Polygon.io COMEX GC options ($29/month)
-        # Set POLYGON_API_KEY in .streamlit/secrets.toml to enable
-        'data_source':     'POLYGON',
+        'data_source':     'POLYGON',  # fallback if Delta doesn't have XAU options
     },
 }
 
@@ -201,8 +194,389 @@ def _load_cache(key: str, max_age: int = 60):
         return None, None
 
 # ============================================================================
-# DERIBIT API — DATA FETCHER
+# DELTA EXCHANGE INDIA — API LAYER
+# Base URL: https://api.india.delta.exchange
+# Market data (tickers, products, candles): PUBLIC — no auth needed
+# Orders API: Requires API key (for future trading features)
+#
+# Your API credentials (from the screenshot):
+# Add to .streamlit/secrets.toml:
+#   DELTA_API_KEY    = "I3SzejlwRZ7R3ZEQG5XofZI9OD5uNl"
+#   DELTA_API_SECRET = "YyoCmF80F9nDd4paOv2vnVPX0wdW7JGLMpObo5clgOfEDRA12UmwwXyTLqgx"
+#
+# NOTE: Never commit secrets.toml to GitHub — add it to .gitignore
+# Docs: https://docs.delta.exchange
 # ============================================================================
+
+def delta_get(endpoint: str, params: dict = None) -> dict:
+    """Generic Delta Exchange India public GET call."""
+    url = f"{DELTA_BASE}{endpoint}"
+    try:
+        r = requests.get(url, params=params or {}, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
+
+
+def delta_get_products(contract_type: str = 'options') -> list:
+    """
+    Fetch all available products from Delta Exchange India.
+    Endpoint: GET /v2/products
+    Returns list of all options instruments.
+    """
+    resp = delta_get("/v2/products", {
+        "contract_types": "call_options,put_options",
+        "states":         "live",
+        "page_size":      500,
+    })
+    return resp.get('result', [])
+
+
+def delta_get_ticker(symbol: str) -> dict:
+    """
+    Fetch live ticker for one instrument.
+    Endpoint: GET /v2/tickers/{symbol}
+    Returns: mark_price, OI, greeks (delta, gamma, theta, vega, rho), IV
+    """
+    resp = delta_get(f"/v2/tickers/{symbol}")
+    return resp.get('result', {})
+
+
+def delta_get_all_tickers(contract_type: str = 'options') -> list:
+    """
+    Fetch tickers for all options in one call — much faster than per-strike.
+    Endpoint: GET /v2/tickers?contract_types=call_options,put_options
+    """
+    resp = delta_get("/v2/tickers", {
+        "contract_types": "call_options,put_options",
+    })
+    return resp.get('result', [])
+
+
+def delta_get_expiries(currency: str) -> list:
+    """
+    Parse available expiry dates for a currency from Delta products list.
+    Returns sorted list of expiry strings like ['25APR26','30MAY26'].
+    """
+    products = delta_get_products()
+    expiries = set()
+    underlying = currency.upper()
+    for p in products:
+        # Filter by underlying asset (BTC, ETH, etc.)
+        und = p.get('underlying_asset', {})
+        if isinstance(und, dict):
+            und_sym = und.get('symbol', '')
+        else:
+            und_sym = str(und)
+        if underlying not in und_sym.upper():
+            continue
+        # Parse expiry from settlement_time or symbol
+        exp_ts = p.get('settlement_time')
+        if exp_ts:
+            try:
+                exp_dt = datetime.utcfromtimestamp(int(exp_ts))
+                expiries.add(exp_dt.strftime('%d%b%y').upper())
+            except Exception:
+                pass
+    return sorted(expiries)
+
+
+def delta_get_spot_price(currency: str) -> float:
+    """
+    Get current spot/mark price for a currency pair.
+    Uses the perpetual futures ticker as spot proxy.
+    """
+    symbol_map = {'BTC': 'BTCUSD', 'ETH': 'ETHUSD', 'XAU': 'XAUUSD'}
+    symbol = symbol_map.get(currency, f"{currency}USD")
+    ticker = delta_get_ticker(symbol)
+
+    # Try mark_price → close → spot_price in order
+    for key in ['mark_price', 'close', 'spot_price']:
+        val = ticker.get(key)
+        if val:
+            try:
+                return float(val)
+            except Exception:
+                pass
+
+    # Fallback defaults
+    return {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}.get(currency, 0.0)
+
+
+def fetch_options_chain_delta(currency: str, expiry: str,
+                               spot_price: float,
+                               atm_range: int = 12) -> pd.DataFrame:
+    """
+    Fetch complete options chain from Delta Exchange India.
+
+    Strategy:
+    1. GET /v2/products → filter by currency + expiry + options
+    2. GET /v2/tickers  → bulk fetch all tickers in one call
+    3. Match call/put pairs by strike
+    4. Extract OI, volume, IV, greeks (delta, gamma, vanna)
+    5. Compute GEX/VANNA/DEX — same formula as India dashboard
+
+    expiry format: 25APR26 (matches Delta's settlement date)
+    """
+    cfg = CRYPTO_CONFIG.get(currency, CRYPTO_CONFIG['BTC'])
+
+    # ── Step 1: Get all products for this currency+expiry ────────────────────
+    all_products = delta_get_products()
+    if not all_products:
+        st.error("Delta Exchange API returned no products. Try refreshing.")
+        return pd.DataFrame()
+        return pd.DataFrame()
+
+    # Parse target expiry to timestamp range for matching
+    try:
+        exp_dt_target = datetime.strptime(expiry, '%d%b%y')
+    except Exception:
+        exp_dt_target = None
+
+    # Filter products: currency + options + matching expiry
+    call_products = {}  # strike → product_info
+    put_products  = {}
+
+    for p in all_products:
+        ct = p.get('contract_type', '')
+        if ct not in ('call_options', 'put_options'):
+            continue
+
+        # Match currency
+        und = p.get('underlying_asset', {})
+        und_sym = und.get('symbol', '') if isinstance(und, dict) else str(und)
+        if currency.upper() not in und_sym.upper():
+            continue
+
+        # Match expiry
+        exp_ts = p.get('settlement_time')
+        if exp_ts and exp_dt_target:
+            try:
+                p_exp = datetime.utcfromtimestamp(int(exp_ts))
+                if p_exp.date() != exp_dt_target.date():
+                    continue
+            except Exception:
+                continue
+
+        strike = p.get('strike_price')
+        if strike is None:
+            continue
+        strike = float(strike)
+
+        if ct == 'call_options':
+            call_products[strike] = p
+        else:
+            put_products[strike] = p
+
+    if not call_products and not put_products:
+        # Try fallback: fetch all tickers and filter
+        st.warning(f"No products found via /v2/products for {currency} {expiry}. "
+                   "Trying bulk tickers fallback...")
+        return _fetch_via_bulk_tickers(currency, expiry, spot_price, atm_range, cfg)
+
+    # ── Step 2: Bulk fetch all tickers ───────────────────────────────────────
+    all_tickers_list = delta_get_all_tickers()
+    ticker_map = {}
+    for t in all_tickers_list:
+        sym = t.get('symbol', '')
+        if sym:
+            ticker_map[sym] = t
+
+    # ── Step 3: Build options chain ──────────────────────────────────────────
+    atm_strike = round(spot_price / cfg['strike_interval']) * cfg['strike_interval']
+    valid_strikes = sorted([
+        s for s in set(list(call_products.keys()) + list(put_products.keys()))
+        if abs(s - atm_strike) <= atm_range * cfg['strike_interval']
+    ])
+
+    if not valid_strikes:
+        # No strikes in ATM range — use all available
+        valid_strikes = sorted(set(list(call_products.keys()) + list(put_products.keys())))
+
+    rows = []
+    progress = st.progress(0, text=f"Processing {currency} strikes...")
+
+    for idx, strike in enumerate(valid_strikes):
+        progress.progress((idx + 1) / max(len(valid_strikes), 1),
+                          text=f"Strike ${strike:,.0f}...")
+
+        cp = call_products.get(strike, {})
+        pp = put_products.get(strike, {})
+
+        call_sym = cp.get('symbol', '')
+        put_sym  = pp.get('symbol', '')
+
+        # Get ticker from bulk map (fast) or individual call (fallback)
+        ct = ticker_map.get(call_sym) or (delta_get_ticker(call_sym) if call_sym else {})
+        pt = ticker_map.get(put_sym)  or (delta_get_ticker(put_sym)  if put_sym  else {})
+
+        # Extract greeks — Delta Exchange returns them in the ticker
+        c_gr = ct.get('greeks', {}) or {}
+        p_gr = pt.get('greeks', {}) or {}
+
+        call_iv     = float(ct.get('mark_iv',       ct.get('iv', 0)) or 0)
+        put_iv      = float(pt.get('mark_iv',        pt.get('iv', 0)) or 0)
+        call_delta  = float(c_gr.get('delta',  0) or 0)
+        put_delta   = float(p_gr.get('delta',  0) or 0)
+        call_gamma  = float(c_gr.get('gamma',  0) or 0)
+        put_gamma   = float(p_gr.get('gamma',  0) or 0)
+        call_vanna  = float(c_gr.get('vanna',  0) or 0)
+        put_vanna   = float(p_gr.get('vanna',  0) or 0)
+
+        # OI from product info (more reliable than ticker for Delta)
+        call_oi     = float(cp.get('open_interest', ct.get('open_interest', 0)) or 0)
+        put_oi      = float(pp.get('open_interest', pt.get('open_interest', 0)) or 0)
+        call_vol    = float(ct.get('volume',     ct.get('turnover', 0)) or 0)
+        put_vol     = float(pt.get('volume',     pt.get('turnover', 0)) or 0)
+
+        # GEX = OI × Gamma × Spot² × ContractSize (same formula)
+        div = cfg['unit_divisor']
+        net_gex_val   = (call_oi * call_gamma - put_oi * put_gamma) * spot_price**2 / div
+        net_vanna_val = (call_oi * call_vanna - put_oi * put_vanna) / div
+        net_dex_val   = (call_oi * call_delta + put_oi * put_delta) / div
+
+        rows.append({
+            'strike':          strike,
+            'call_oi':         call_oi,
+            'put_oi':          put_oi,
+            'call_volume':     call_vol,
+            'put_volume':      put_vol,
+            'call_iv':         call_iv,
+            'put_iv':          put_iv,
+            'call_delta':      call_delta,
+            'put_delta':       put_delta,
+            'call_gamma':      call_gamma,
+            'put_gamma':       put_gamma,
+            'call_vanna':      call_vanna,
+            'put_vanna':       put_vanna,
+            'net_gex':         net_gex_val,
+            'net_vanna':       net_vanna_val,
+            'net_dex':         net_dex_val,
+            'total_volume':    call_vol + put_vol,
+            'call_oi_change':  0.0,
+            'put_oi_change':   0.0,
+            'call_gex_flow':   0.0,
+            'put_gex_flow':    0.0,
+            'net_gex_flow':    0.0,
+            'spot_price':      spot_price,
+            'timestamp':       datetime.utcnow().replace(tzinfo=pytz.utc),
+        })
+
+    progress.empty()
+
+    if not rows:
+        st.error(f"No data for {currency} {expiry}. Check expiry or widen ATM range.")
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df.attrs['unit_divisor'] = cfg['unit_divisor']
+    # Enrich zero Greeks with Black-Scholes
+    df = enrich_greeks_with_bs(df, spot_price, expiry)
+    df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
+    return df
+
+
+def _fetch_via_bulk_tickers(currency: str, expiry: str, spot_price: float,
+                              atm_range: int, cfg: dict) -> pd.DataFrame:
+    """
+    Fallback: parse all tickers and match by symbol naming convention.
+    Delta Exchange symbol format: C-BTC-{strike}-{DDMMMYY}
+    e.g. C-BTC-70000-250425 or BTC-25APR25-70000-C
+    """
+    all_tickers = delta_get_all_tickers()
+    if not all_tickers:
+        return pd.DataFrame()
+
+    # Try to parse expiry date for matching
+    try:
+        exp_dt = datetime.strptime(expiry, '%d%b%y')
+        exp_str_variants = [
+            exp_dt.strftime('%d%m%y'),   # 250425
+            exp_dt.strftime('%d%b%y').upper(),  # 25APR25
+            exp_dt.strftime('%Y%m%d'),   # 20250425
+        ]
+    except Exception:
+        exp_str_variants = [expiry]
+
+    calls = {}
+    puts  = {}
+    for t in all_tickers:
+        sym = t.get('symbol', '').upper()
+        # Check if this ticker matches our currency
+        if currency.upper() not in sym:
+            continue
+        # Check expiry
+        matched_exp = any(ev in sym for ev in exp_str_variants)
+        if not matched_exp:
+            continue
+        # Parse strike
+        strike = None
+        for part in sym.split('-'):
+            try:
+                v = float(part)
+                if v > 100:  # strikes are always > 100
+                    strike = v
+                    break
+            except Exception:
+                continue
+        if strike is None:
+            continue
+        # Classify call/put
+        if sym.startswith('C-') or sym.endswith('-C') or 'CALL' in sym:
+            calls[strike] = t
+        elif sym.startswith('P-') or sym.endswith('-P') or 'PUT' in sym:
+            puts[strike] = t
+
+    if not calls and not puts:
+        return pd.DataFrame()
+
+    rows = []
+    atm  = round(spot_price / cfg['strike_interval']) * cfg['strike_interval']
+    div  = cfg['unit_divisor']
+
+    for strike in sorted(set(list(calls.keys()) + list(puts.keys()))):
+        if abs(strike - atm) > atm_range * cfg['strike_interval']:
+            continue
+        ct = calls.get(strike, {})
+        pt = puts.get(strike, {})
+        c_gr = ct.get('greeks', {}) or {}
+        p_gr = pt.get('greeks', {}) or {}
+        call_oi    = float(ct.get('open_interest', 0) or 0)
+        put_oi     = float(pt.get('open_interest', 0) or 0)
+        call_gamma = float(c_gr.get('gamma', 0) or 0)
+        put_gamma  = float(p_gr.get('gamma', 0) or 0)
+        call_vanna = float(c_gr.get('vanna', 0) or 0)
+        put_vanna  = float(p_gr.get('vanna', 0) or 0)
+        call_delta = float(c_gr.get('delta', 0) or 0)
+        put_delta  = float(p_gr.get('delta', 0) or 0)
+        rows.append({
+            'strike':       strike,
+            'call_oi':      call_oi,
+            'put_oi':       put_oi,
+            'call_volume':  float(ct.get('volume', 0) or 0),
+            'put_volume':   float(pt.get('volume', 0) or 0),
+            'call_iv':      float(ct.get('mark_iv', 0) or 0),
+            'put_iv':       float(pt.get('mark_iv', 0) or 0),
+            'call_delta':   call_delta,  'put_delta':  put_delta,
+            'call_gamma':   call_gamma,  'put_gamma':  put_gamma,
+            'call_vanna':   call_vanna,  'put_vanna':  put_vanna,
+            'net_gex':      (call_oi*call_gamma - put_oi*put_gamma)*spot_price**2/div,
+            'net_vanna':    (call_oi*call_vanna - put_oi*put_vanna)/div,
+            'net_dex':      (call_oi*call_delta + put_oi*put_delta)/div,
+            'total_volume': float(ct.get('volume',0) or 0) + float(pt.get('volume',0) or 0),
+            'call_oi_change': 0.0, 'put_oi_change': 0.0,
+            'call_gex_flow':  0.0, 'put_gex_flow':  0.0, 'net_gex_flow': 0.0,
+            'spot_price':   spot_price,
+            'timestamp':    datetime.utcnow().replace(tzinfo=pytz.utc),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df.attrs['unit_divisor'] = cfg['unit_divisor']
+    df = enrich_greeks_with_bs(df, spot_price, expiry)
+    df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
+    return df
 
 # ============================================================================
 # BLACK-SCHOLES GREEKS — fallback when broker API doesn't return vanna/gamma
@@ -349,184 +723,8 @@ def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
     return df
 
 
-def deribit_get(method: str, params: dict = None) -> dict:
-    """Generic Deribit public API call — no authentication needed."""
-    url = f"{DERIBIT_BASE}/public/{method}"
-    try:
-        r = requests.get(url, params=params or {}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if 'result' in data:
-            return data['result']
-        return {}
-    except Exception as e:
-        # Silently return empty — caller handles missing strikes gracefully
-        return {}
-
-
-def get_deribit_instruments(currency: str) -> list:
-    """Get all active options instruments for a currency."""
-    result = deribit_get("get_instruments", {
-        "currency": currency,
-        "kind":     "option",
-        "expired":  False,
-    })
-    return result if isinstance(result, list) else []
-
-
-def get_deribit_expiries(currency: str) -> list:
-    """Return sorted list of available expiry dates."""
-    instruments = get_deribit_instruments(currency)
-    expiries = set()
-    for ins in instruments:
-        # instrument_name format: BTC-31JAN25-50000-C
-        parts = ins.get('instrument_name', '').split('-')
-        if len(parts) >= 2:
-            expiries.add(parts[1])
-    return sorted(expiries)
-
-
-def get_deribit_ticker(instrument_name: str) -> dict:
-    """Get live ticker for one option instrument."""
-    return deribit_get("ticker", {"instrument_name": instrument_name})
-
-
-def fetch_options_chain(currency: str, expiry: str,
-                        spot_price: float, atm_range: int = 12) -> pd.DataFrame:
-    """
-    Fetch full options chain for currency+expiry and compute Greeks.
-
-    Returns DataFrame with columns matching India dashboard schema:
-        strike, call_oi, put_oi, call_volume, put_volume,
-        call_iv, put_iv, call_delta, put_delta,
-        call_gamma, put_gamma, call_vanna, put_vanna,
-        net_gex, net_vanna, net_dex, total_volume,
-        call_oi_change, put_oi_change, enhanced_oi_gex,
-        spot_price, timestamp
-    """
-    cfg = CRYPTO_CONFIG[currency]
-
-    # Route XAU to Polygon.io (Deribit does not list XAU options)
-    if currency == 'XAU':
-        api_key = get_polygon_api_key()
-        if not api_key:
-            st.error(
-                "🥇 **XAU (Gold) options require Polygon.io API key.**\n\n"
-                "Deribit does not list XAU options. COMEX Gold options are available via Polygon.io:\n\n"
-                "1. Sign up FREE at **https://polygon.io** (takes 2 minutes)\n"
-                "2. Copy your API key from the dashboard\n"
-                "3. Add to `.streamlit/secrets.toml`:\n"
-                "```\nPOLYGON_API_KEY = \"your_key_here\"\n```\n"
-                "4. Free tier gives limited calls. **Starter plan = $29/month** for full chain.\n\n"
-                "For now, try **BTC or ETH** to explore the dashboard."
-            )
-            return pd.DataFrame()
-        # Convert expiry format: 04APR26 → 2026-04-04
-        try:
-            exp_dt      = datetime.strptime(expiry, '%d%b%y')
-            expiry_date = exp_dt.strftime('%Y-%m-%d')
-        except Exception:
-            expiry_date = expiry
-        return get_polygon_gold_snapshot(spot_price, expiry_date, atm_range)
-
-    strike_interval = cfg['strike_interval']
-
-    # Build ATM strike range
-    atm_strike = round(spot_price / strike_interval) * strike_interval
-    strikes_to_fetch = [
-        atm_strike + i * strike_interval
-        for i in range(-atm_range, atm_range + 1)
-    ]
-
-    rows = []
-    progress = st.progress(0, text=f"Fetching {currency} options chain...")
-
-    for idx, strike in enumerate(strikes_to_fetch):
-        progress.progress((idx + 1) / len(strikes_to_fetch),
-                          text=f"Fetching strike {strike:,.0f}...")
-
-        call_name = f"{currency}-{expiry}-{int(strike)}-C"
-        put_name  = f"{currency}-{expiry}-{int(strike)}-P"
-
-        call_t = get_deribit_ticker(call_name)
-        put_t  = get_deribit_ticker(put_name)
-        time.sleep(0.05)  # gentle rate limiting
-
-        if not call_t and not put_t:
-            continue  # Strike doesn't exist for this expiry — skip silently
-
-        # Greeks from Deribit (they compute BS Greeks server-side)
-        c_greeks = call_t.get('greeks', {})
-        p_greeks = put_t.get('greeks', {})
-
-        call_iv     = call_t.get('mark_iv', 0) / 100.0
-        put_iv      = put_t.get('mark_iv', 0)  / 100.0
-        call_delta  = c_greeks.get('delta', 0)
-        put_delta   = p_greeks.get('delta', 0)
-        call_gamma  = c_greeks.get('gamma', 0)
-        put_gamma   = p_greeks.get('gamma', 0)
-        call_vanna  = c_greeks.get('vanna', 0)
-        put_vanna   = p_greeks.get('vanna', 0)
-        call_oi     = call_t.get('open_interest', 0)
-        put_oi      = put_t.get('open_interest', 0)
-        call_vol    = call_t.get('stats', {}).get('volume', 0)
-        put_vol     = put_t.get('stats', {}).get('volume', 0)
-
-        cs = cfg['contract_size']
-
-        # GEX = OI × Gamma × Spot² × ContractSize  (same formula as India)
-        net_gex_val   = (call_oi * call_gamma - put_oi * put_gamma) * spot_price ** 2 * cs
-        net_vanna_val = (call_oi * call_vanna - put_oi * put_vanna) * cs
-        net_dex_val   = (call_oi * call_delta + put_oi * put_delta) * cs
-
-        rows.append({
-            'strike':       strike,
-            'call_oi':      call_oi,
-            'put_oi':       put_oi,
-            'call_volume':  call_vol,
-            'put_volume':   put_vol,
-            'call_iv':      call_iv * 100,
-            'put_iv':       put_iv  * 100,
-            'call_delta':   call_delta,
-            'put_delta':    put_delta,
-            'call_gamma':   call_gamma,
-            'put_gamma':    put_gamma,
-            'call_vanna':   call_vanna,
-            'put_vanna':    put_vanna,
-            'net_gex':      net_gex_val   / cfg['unit_divisor'],
-            'net_vanna':    net_vanna_val / cfg['unit_divisor'],
-            'net_dex':      net_dex_val   / cfg['unit_divisor'],
-            'total_volume': call_vol + put_vol,
-            # OI change placeholders (populated on refresh)
-            'call_oi_change':  0.0,
-            'put_oi_change':   0.0,
-            'call_gex_flow':   0.0,
-            'put_gex_flow':    0.0,
-            'net_gex_flow':    0.0,
-            'spot_price':   spot_price,
-            'timestamp':    datetime.utcnow().replace(tzinfo=pytz.utc),
-        })
-
-    progress.empty()
-
-    if not rows:
-        st.error(
-            f"No option data returned for {currency} {expiry}. "
-            "Possible reasons:\n"
-            "1. Expiry date has already passed — select a future expiry\n"
-            "2. Deribit does not list XAU options (check currency dropdown)\n"
-            "3. Strike range too narrow — try wider ATM range\n"
-            "Tip: For XAU, try BTC or ETH first to confirm connectivity."
-        )
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    # Store unit_divisor for BS enrichment
-    df.attrs['unit_divisor'] = cfg['unit_divisor']
-    # Enrich zeros/missing Greeks with Black-Scholes (handles Deribit missing vanna)
-    df = enrich_greeks_with_bs(df, spot_price, expiry)
-    df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
-    return df
+# NOTE: fetch_options_chain now uses Delta Exchange India (see fetch_options_chain_delta above)
+# Legacy Deribit functions removed — replaced by delta_get, delta_get_products etc.
 
 
 def _compute_enhanced_oi_gex_crypto(df: pd.DataFrame,
@@ -687,44 +885,69 @@ def get_spot_price(currency: str) -> float:
 # HISTORICAL DATA (Deribit free tier — settlement prices + last 5 days trades)
 # ============================================================================
 
-def get_deribit_historical_settlement(currency: str, count: int = 10) -> pd.DataFrame:
+def get_delta_historical_candles(currency: str, resolution: str = '1d',
+                                  days_back: int = 30) -> pd.DataFrame:
     """
-    Fetch historical settlement/expiry data for a currency.
-    Shows how GEX evolved across past expiries.
-    FREE on Deribit — no auth needed.
+    Fetch historical OHLC candles from Delta Exchange India.
+    Endpoint: GET /v2/history/candles
+    resolution: 1m, 5m, 15m, 1h, 4h, 1d
+    FREE — no auth needed.
     """
-    result = deribit_get("get_delivery_prices", {
-        "index_name": f"{currency.lower()}_usd",
-        "count":      count,
-        "offset":     0,
+    symbol = CRYPTO_CONFIG.get(currency, {}).get('delta_symbol', f'{currency}USD')
+    end_ts   = int(datetime.utcnow().timestamp())
+    start_ts = int((datetime.utcnow() - timedelta(days=days_back)).timestamp())
+    resp = delta_get("/v2/history/candles", {
+        "resolution": resolution,
+        "symbol":     symbol,
+        "start":      str(start_ts),
+        "end":        str(end_ts),
     })
-    if not result or 'data' not in result:
+    candles = resp.get('result', [])
+    if not candles:
         return pd.DataFrame()
     rows = []
-    for item in result.get('data', []):
-        rows.append({
-            'date':            item.get('date', ''),
-            'delivery_price':  item.get('delivery_price', 0),
-        })
+    for c in candles:
+        try:
+            rows.append({
+                'timestamp': datetime.utcfromtimestamp(int(c.get('time', 0))),
+                'open':  float(c.get('open',  0)),
+                'high':  float(c.get('high',  0)),
+                'low':   float(c.get('low',   0)),
+                'close': float(c.get('close', 0)),
+                'volume':float(c.get('volume',0)),
+            })
+        except Exception:
+            continue
     return pd.DataFrame(rows)
 
 
-def get_deribit_historical_iv(currency: str, expiry: str) -> pd.DataFrame:
+def get_delta_historical_settlement(currency: str, count: int = 10) -> pd.DataFrame:
     """
-    Reconstruct approximate historical IV snapshot using Deribit
-    historical volatility endpoint (free).
-    Returns 30-day realized vol history.
+    Approximate settlement history using daily candles.
+    Delta Exchange India doesn't have a direct settlement endpoint.
     """
-    result = deribit_get("get_historical_volatility", {"currency": currency})
-    if not isinstance(result, list):
+    df = get_delta_historical_candles(currency, '1d', days_back=count*7)
+    if df.empty:
         return pd.DataFrame()
-    rows = []
-    for item in result[-30:]:  # last 30 days
-        if isinstance(item, list) and len(item) >= 2:
-            ts  = datetime.utcfromtimestamp(item[0] / 1000)
-            vol = item[1]
-            rows.append({'timestamp': ts, 'realized_vol': vol})
-    return pd.DataFrame(rows)
+    df_out = df[['timestamp','close']].rename(
+        columns={'timestamp':'date','close':'delivery_price'})
+    df_out['date'] = df_out['date'].dt.strftime('%Y-%m-%d')
+    return df_out.tail(count).reset_index(drop=True)
+
+
+def get_delta_historical_iv(currency: str, expiry: str = '') -> pd.DataFrame:
+    """
+    Approximate realized vol from daily candle returns.
+    Returns 30-day rolling volatility (annualised).
+    """
+    df = get_delta_historical_candles(currency, '1d', days_back=60)
+    if df.empty:
+        return pd.DataFrame()
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    df['returns']      = df['close'].pct_change()
+    df['realized_vol'] = df['returns'].rolling(30, min_periods=5).std() * (365**0.5) * 100
+    df = df.dropna(subset=['realized_vol'])
+    return df[['timestamp','realized_vol']].reset_index(drop=True)
 
 
 def create_historical_vol_chart(vol_df: pd.DataFrame,
@@ -1280,6 +1503,336 @@ def create_enhanced_vanna_overlay_chart(df: pd.DataFrame, spot_price: float,
     return fig
 
 
+def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float,
+                                               unit_label: str = 'K',
+                                               symbol: str = 'BTC') -> go.Figure:
+    """
+    Enhanced GEX Overlay — Original GEX (green/red) + Enhanced OI GEX (purple/gold)
+    overlaid on same chart with volume bars. Ported from India dashboard Tab 2.
+    """
+    cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
+    emoj = cfg['emoji']
+    df_s = df.sort_values('strike').reset_index(drop=True)
+
+    for col in ['net_gex', 'enhanced_oi_gex', 'call_volume', 'put_volume', 'total_volume']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
+
+    if df_s['enhanced_oi_gex'].abs().sum() == 0:
+        df_s = _compute_enhanced_oi_gex_crypto(df_s, spot_price, unit_label)
+
+    max_gex = df_s['net_gex'].abs().max() or 1
+    max_enh = df_s['enhanced_oi_gex'].abs().max() or 1
+    flip_zones = identify_gamma_flip_zones(df_s, spot_price)
+
+    fig = go.Figure()
+
+    # Original GEX — green/red semi-transparent
+    orig_colors = ['rgba(16,185,129,0.55)' if x >= 0 else 'rgba(239,68,68,0.55)'
+                   for x in df_s['net_gex']]
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['net_gex'], orientation='h',
+        marker=dict(color=orig_colors, line=dict(width=0)),
+        name=f'Standard GEX — Max: {max_gex:.4f}{unit_label}',
+        hovertemplate='Strike: %{y:,.0f}<br>GEX: %{x:.4f}' + unit_label + '<extra></extra>',
+    ))
+
+    # Enhanced OI GEX — purple/gold opaque overlay
+    enh_colors = ['rgba(139,92,246,0.88)' if x >= 0 else 'rgba(245,158,11,0.88)'
+                  for x in df_s['enhanced_oi_gex']]
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['enhanced_oi_gex'], orientation='h',
+        marker=dict(color=enh_colors, line=dict(color='rgba(255,255,255,0.3)', width=1)),
+        name=f'Enhanced OI GEX — Max: {max_enh:.4f}{unit_label}',
+        hovertemplate='Strike: %{y:,.0f}<br>Enh OI GEX: %{x:.4f}' + unit_label + '<extra></extra>',
+        width=0.4,
+    ))
+
+    # Volume overlay (right axis x2)
+    max_vol = max(df_s['call_volume'].max(), df_s['put_volume'].max(), 1)
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['call_volume'].fillna(0),
+        orientation='h', name='Call Volume',
+        marker=dict(color='rgba(16,185,129,0.18)', line=dict(width=0)),
+        xaxis='x2', showlegend=True,
+    ))
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['put_volume'].fillna(0),
+        orientation='h', name='Put Volume',
+        marker=dict(color='rgba(239,68,68,0.18)', line=dict(width=0)),
+        xaxis='x2', showlegend=True,
+    ))
+
+    # Spot line
+    fig.add_hline(y=spot_price,
+                  line=dict(color='#fbbf24', width=2.5, dash='dash'),
+                  annotation_text=f'Spot: {spot_price:,.2f}',
+                  annotation_font=dict(color='#fbbf24', size=12))
+
+    # GEX flip zones
+    for fz in flip_zones[:5]:
+        fig.add_hline(y=fz['strike'],
+                      line=dict(color=fz['color'], width=1.5, dash='dot'),
+                      annotation_text=f"Flip {fz['arrow']} {fz['strike']:,.0f}",
+                      annotation_font=dict(color=fz['color'], size=10))
+
+    fig.update_layout(
+        title=(
+            f'{emoj} {symbol} Enhanced GEX Overlay — '
+            f'Green/Red = Standard GEX | Purple/Gold = Enhanced OI GEX'
+        ),
+        xaxis=dict(
+            title=f'Net GEX ({unit_label})',
+            zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
+            gridcolor='rgba(128,128,128,0.2)',
+        ),
+        xaxis2=dict(
+            overlaying='x', side='top', title='Volume',
+            range=[0, max_vol * 5], showgrid=False,
+            tickfont=dict(size=9, color='rgba(148,163,184,0.5)'),
+            title_font=dict(size=10, color='rgba(148,163,184,0.5)'),
+        ),
+        yaxis_title='Strike Price (USD)',
+        barmode='overlay', bargap=0.15,
+        height=700, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        legend=dict(
+            orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1,
+            bgcolor='rgba(15,23,42,0.7)', bordercolor='#2d3748', borderwidth=1,
+            font=dict(size=10),
+        ),
+        annotations=[dict(
+            x=0.01, y=0.01, xref='paper', yref='paper',
+            text='Green/Red (transparent) = Total accumulated OI GEX &nbsp;|&nbsp; '
+                 'Purple/Gold (opaque) = Fresh OI change &times; Greeks &times; Vol &times; IV',
+            font=dict(size=9, color='#64748b'), showarrow=False,
+        )],
+    )
+    return fig
+
+
+def create_standard_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
+                                        unit_label: str = 'K',
+                                        symbol: str = 'BTC') -> go.Figure:
+    """
+    Standard VANNA chart — Call VANNA vs Put VANNA side by side.
+    Shows dDelta/dVol per strike. Ported from India dashboard Tab 4.
+    """
+    cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
+    emoj = cfg['emoji']
+    df_s = df.sort_values('strike').reset_index(drop=True)
+
+    for col in ['call_vanna', 'put_vanna']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=[
+            f'📈 {symbol} Call VANNA (dDelta/dVol)',
+            f'📉 {symbol} Put VANNA (dDelta/dVol)',
+        ],
+        horizontal_spacing=0.10,
+    )
+
+    call_colors = ['#10b981' if x >= 0 else '#ef4444' for x in df_s['call_vanna']]
+    put_colors  = ['#10b981' if x >= 0 else '#ef4444' for x in df_s['put_vanna']]
+
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['call_vanna'], orientation='h',
+        marker=dict(color=call_colors),
+        name='Call VANNA',
+        hovertemplate='Strike: %{y:,.0f}<br>Call VANNA: %{x:.6f}' + unit_label + '<extra></extra>',
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['put_vanna'], orientation='h',
+        marker=dict(color=put_colors),
+        name='Put VANNA',
+        hovertemplate='Strike: %{y:,.0f}<br>Put VANNA: %{x:.6f}' + unit_label + '<extra></extra>',
+    ), row=1, col=2)
+
+    for col_num in [1, 2]:
+        fig.add_hline(
+            y=spot_price, row=1, col=col_num,
+            line=dict(color='#fbbf24', width=2, dash='dash'),
+            annotation_text=f'Spot {spot_price:,.2f}',
+            annotation_font=dict(color='#fbbf24', size=11),
+        )
+
+    call_sum = df_s['call_vanna'].sum()
+    put_sum  = df_s['put_vanna'].sum()
+    net_sum  = df_s['net_vanna'].sum() if 'net_vanna' in df_s.columns else call_sum - abs(put_sum)
+
+    fig.update_layout(
+        title=(
+            f'{emoj} {symbol} Standard VANNA — dDelta/dVol per Strike<br>'
+            f'<sup>Call VANNA: {call_sum:+.4f}{unit_label} | '
+            f'Put VANNA: {put_sum:+.4f}{unit_label} | '
+            f'Net: {net_sum:+.4f}{unit_label}</sup>'
+        ),
+        height=650, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        showlegend=False, hovermode='closest',
+        margin=dict(l=80, r=80, t=110, b=80),
+    )
+    fig.update_xaxes(
+        title_text=f'VANNA ({unit_label})',
+        gridcolor='rgba(128,128,128,0.2)', showgrid=True,
+        zeroline=True, zerolinecolor='rgba(255,255,255,0.25)', zerolinewidth=1,
+    )
+    fig.update_yaxes(
+        title_text='Strike Price (USD)',
+        gridcolor='rgba(128,128,128,0.2)', showgrid=True,
+    )
+    return fig
+
+
+def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
+                                           unit_label: str = 'K',
+                                           symbol: str = 'BTC') -> go.Figure:
+    """
+    Enhanced OI VANNA — pink/magenta bars weighted by OI change × Greeks × IV × Volume × Distance.
+    Ported from India dashboard Tab 6.
+    """
+    cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
+    emoj = cfg['emoji']
+    df_s = df.sort_values('strike').reset_index(drop=True)
+
+    for col in ['call_vanna','put_vanna','net_vanna','call_iv','put_iv',
+                'call_oi','put_oi','total_volume','call_volume','put_volume']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
+
+    # Compute Enhanced OI VANNA (vectorised — same approach as enhanced OI GEX)
+    dist     = (df_s['strike'] - spot_price).abs()
+    max_dist = dist.max() or 1
+    dist_w   = 1 - (dist / max_dist) * 0.5
+
+    avg_iv   = (df_s['call_iv'].clip(lower=1) + df_s['put_iv'].clip(lower=1)) / 2
+    iv_mean  = avg_iv.mean() or 65
+    iv_adj   = (avg_iv / iv_mean).clip(0.5, 2.5)
+
+    vol_mean = df_s['total_volume'].replace(0, np.nan).mean() or 1
+    vol_w    = (df_s['total_volume'] / vol_mean).clip(0.1, 3.0)
+
+    # Use OI as proxy for OI change (same as enhanced GEX fallback)
+    call_oi_delta = df_s['call_oi'] * 0.05
+    put_oi_delta  = df_s['put_oi']  * 0.05
+
+    enh_call = call_oi_delta * df_s['call_vanna'].abs() * vol_w * iv_adj * dist_w
+    enh_put  = put_oi_delta  * df_s['put_vanna'].abs()  * vol_w * iv_adj * dist_w
+
+    # Scale to same magnitude as net_vanna for comparability
+    ref_max   = df_s['net_vanna'].abs().max() or 1
+    enh_scale = ref_max / (enh_call + enh_put).abs().mean()                 if (enh_call + enh_put).abs().mean() > 0 else 1
+    enh_vanna = (enh_call - enh_put) * enh_scale
+
+    max_enh_v   = enh_vanna.abs().max() or 1
+    vanna_zones = identify_vanna_flip_zones(df_s, spot_price)
+    iv_df       = compute_iv_trend(df_s)
+    iv_regime   = 'FLAT'
+    iv_skew     = 0.0
+    if not iv_df.empty and 'iv_regime' in iv_df.columns:
+        iv_regime = str(iv_df.iloc[-1]['iv_regime'])
+        iv_skew   = float(iv_df.iloc[-1].get('iv_skew', 0.0))
+    iv_color = {'EXPANDING':'#ef4444','COMPRESSING':'#10b981','FLAT':'#94a3b8'}.get(iv_regime,'#94a3b8')
+
+    role_colors = {
+        'RESISTANCE_CEILING': '#ef4444',
+        'VACUUM_ZONE':        '#10b981',
+        'TRAP_DOOR':          '#f59e0b',
+        'SUPPORT_FLOOR':      '#06b6d4',
+    }
+    role_icons = {
+        'RESISTANCE_CEILING': '🔴',
+        'VACUUM_ZONE':        '🚀',
+        'TRAP_DOOR':          '⚠️',
+        'SUPPORT_FLOOR':      '🛡️',
+    }
+
+    fig = go.Figure()
+
+    # Pink/magenta bars
+    bar_colors = ['rgba(236,72,153,0.88)' if x >= 0 else 'rgba(190,24,93,0.88)'
+                  for x in enh_vanna]
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=enh_vanna, orientation='h',
+        marker=dict(color=bar_colors, line=dict(color='rgba(255,255,255,0.2)', width=1)),
+        name=f'Enhanced OI VANNA — Max: {max_enh_v:.4f}{unit_label}',
+        hovertemplate='Strike: %{y:,.0f}<br>Enh OI VANNA: %{x:.4f}' + unit_label + '<extra></extra>',
+    ))
+
+    # Volume overlay
+    max_vol = max(df_s['call_volume'].max(), df_s['put_volume'].max(), 1)
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['call_volume'],
+        orientation='h', name='Call Vol',
+        marker=dict(color='rgba(16,185,129,0.15)', line=dict(width=0)),
+        xaxis='x2',
+    ))
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=df_s['put_volume'],
+        orientation='h', name='Put Vol',
+        marker=dict(color='rgba(239,68,68,0.15)', line=dict(width=0)),
+        xaxis='x2',
+    ))
+
+    # Spot line
+    fig.add_hline(y=spot_price,
+                  line=dict(color='#fbbf24', width=2.5, dash='dash'),
+                  annotation_text=f'Spot: {spot_price:,.2f}',
+                  annotation_font=dict(color='#fbbf24', size=12))
+
+    # VANNA flip zone lines
+    for vz in vanna_zones[:6]:
+        fig.add_hline(
+            y=vz['strike'],
+            line=dict(color=role_colors[vz['role']], width=2, dash='dot'),
+            annotation_text=(
+                role_icons[vz['role']] + ' ' +
+                f"{vz['strike']:,.0f} · {vz['role'].replace('_',' ')}"
+            ),
+            annotation_font=dict(color=role_colors[vz['role']], size=10),
+            annotation_position='right',
+        )
+
+    fig.update_layout(
+        title=(
+            f'{emoj} {symbol} Enhanced OI VANNA<br>'
+            f'<sup>Pink = Positive OI-weighted VANNA | Deep Pink = Negative | '
+            f'IV: <span style="color:{iv_color}">{iv_regime}</span> | '
+            f'Skew: {iv_skew:+.1f}% | Max: {max_enh_v:.4f}{unit_label}</sup>'
+        ),
+        xaxis=dict(
+            title=f'Enhanced OI VANNA ({unit_label})',
+            zeroline=True, zerolinecolor='rgba(255,255,255,0.25)', zerolinewidth=2,
+            gridcolor='rgba(128,128,128,0.2)',
+        ),
+        xaxis2=dict(
+            overlaying='x', side='top', title='Volume',
+            range=[0, max_vol * 5], showgrid=False,
+            tickfont=dict(size=9, color='rgba(148,163,184,0.5)'),
+            title_font=dict(size=10, color='rgba(148,163,184,0.5)'),
+        ),
+        yaxis_title='Strike Price (USD)',
+        barmode='overlay',
+        height=720, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        legend=dict(
+            x=0.01, y=0.99, bgcolor='rgba(15,23,42,0.7)',
+            bordercolor='#2d3748', borderwidth=1, font=dict(size=10),
+        ),
+    )
+    return fig
+
+
 def create_iv_smile_chart(df: pd.DataFrame, spot_price: float,
                            symbol: str = 'BTC') -> go.Figure:
     """IV Smile / Skew chart — unique to crypto, very informative."""
@@ -1374,14 +1927,14 @@ def show_landing() -> bool:
     hero = (
         '<div class="lp-hero">'
         '<div class="lp-badge-row">'
-        '<span class="lp-badge"><span class="lp-badge-dot"></span>LIVE &#8212; Deribit API</span>'
+        '<span class="lp-badge"><span class="lp-badge-dot"></span>LIVE &#8212; Delta Exchange India</span>'
         '<span class="lp-badge"><span class="lp-badge-dot"></span>&#x20BF; BTC &middot; &#x1F537; ETH &middot; &#x1F947; XAU Gold</span>'
         '<span class="lp-badge"><span class="lp-badge-dot"></span>24/7 Global Markets</span>'
         '</div>'
         '<div class="lp-headline">Crypto &amp; Gold<br>GEX / VANNA Analytics</div>'
         '<div class="lp-subline">'
         'Institutional-grade Gamma Exposure &middot; VANNA Cascade &middot; Dealer Flow analytics<br>'
-        'for BTC, ETH and XAU options &mdash; powered by Deribit &mdash; by NYZTrade Analytics'
+        'for BTC, ETH and XAU options &mdash; powered by Delta Exchange India &mdash; by NYZTrade Analytics'
         '</div>'
         '<div class="lp-social-row">'
         '<a class="lp-social-btn lp-social-yt" href="https://www.youtube.com/@nyztrade" target="_blank">&#9654; YouTube &#8212; @nyztrade</a>'
@@ -1497,7 +2050,7 @@ def main():
         '<div style="display:flex;justify-content:space-between;align-items:center;">'
         '<div>'
         '<h1 class="main-title">&#x20BF; NYZTrade Crypto GEX Dashboard</h1>'
-        '<p class="sub-title">BTC &middot; ETH &middot; XAU Gold | GEX / VANNA / Cascade | Deribit API | 24/7 Live</p>'
+        '<p class="sub-title">BTC &middot; ETH &middot; XAU Gold | GEX / VANNA / Cascade | Delta Exchange India | 24/7 Live</p>'
         '</div>'
         '<div class="live-indicator"><div class="live-dot"></div>'
         '<span style="color:#ef4444;font-family:JetBrains Mono,monospace;font-size:0.8rem;">'
@@ -1528,13 +2081,12 @@ def main():
         if currency == 'XAU':
             api_key = get_polygon_api_key()
             if api_key:
-                st.success("✅ Polygon.io API key detected — XAU (COMEX Gold) ready!")
+                st.success("✅ Polygon.io key detected — XAU Gold ready!")
             else:
-                st.warning(
-                    "🥇 **XAU needs Polygon.io API key.**\n"
-                    "Deribit does not list XAU options.\n"
-                    "Add `POLYGON_API_KEY` to secrets.toml.\n"
-                    "Free signup: https://polygon.io"
+                st.info(
+                    "🥇 XAU needs Polygon.io key for COMEX Gold.\n"
+                    "Add POLYGON_API_KEY to secrets.toml.\n"
+                    "Free: polygon.io"
                 )
 
         st.markdown("---")
@@ -1546,7 +2098,7 @@ def main():
         if 'spot_price' not in st.session_state or \
            st.session_state.get('spot_currency') != currency:
             with st.spinner(f"Fetching {currency} spot..."):
-                sp = get_spot_price(currency)
+                sp = delta_get_spot_price(currency)
                 st.session_state['spot_price']    = sp
                 st.session_state['spot_currency'] = currency
         spot_price = st.session_state['spot_price']
@@ -1593,7 +2145,7 @@ def main():
             if 'expiries' not in st.session_state or \
                st.session_state.get('expiry_currency') != currency:
                 with st.spinner("Loading expiries..."):
-                    expiries = get_deribit_expiries(currency)
+                    expiries = delta_get_expiries(currency)
                     st.session_state['expiries']        = expiries
                     st.session_state['expiry_currency'] = currency
             else:
@@ -1654,8 +2206,8 @@ def main():
         df, meta  = _load_cache(cache_key, max_age)
         if df is None:
             with st.spinner(f"Fetching {currency} {selected_expiry} options chain from Deribit..."):
-                df = fetch_options_chain(currency, selected_expiry,
-                                         spot_price, atm_range)
+                df = fetch_options_chain_delta(currency, selected_expiry,
+                                             spot_price, atm_range)
             if df is not None and not df.empty:
                 meta = {
                     'symbol': currency, 'expiry': selected_expiry,
@@ -1813,8 +2365,11 @@ def main():
         # ── TABS ──────────────────────────────────────────────────────────────
         tabs = st.tabs([
             "🎯 Standard GEX",
+            "🚀 Enhanced GEX Overlay",
             "🚀 Enhanced OI GEX",
-            "🌊 VANNA Exposure",
+            "🌊 Standard VANNA",
+            "🌊 Enhanced VANNA Overlay",
+            "🌊 Enhanced OI VANNA",
             "📐 Cascade Mathematics",
             "📈 IV Smile / Skew",
             "📋 OI Distribution",
@@ -1833,8 +2388,21 @@ def main():
             c2.metric("Negative GEX", f"{df[df['net_gex']<0]['net_gex'].sum():.4f}{unit_label}")
             c3.metric("GEX Flip Zones", str(len(flip_zones)))
 
-        # Tab 1 — Enhanced OI GEX
+        # Tab 1 — Enhanced GEX Overlay
         with tabs[1]:
+            st.markdown(f"### \U0001f680 {currency} Enhanced GEX Overlay")
+            st.caption("Green/Red (transparent) = Standard GEX total OI | Purple/Gold (opaque) = Enhanced OI GEX fresh positioning")
+            st.plotly_chart(
+                create_enhanced_gex_overlay_chart_crypto(df, spot_price, unit_label, currency),
+                use_container_width=True)
+            eo1, eo2, eo3, eo4 = st.columns(4)
+            eo1.metric("Standard GEX Total",  f"{df['net_gex'].sum():.4f}{unit_label}")
+            eo2.metric("Enh Positive GEX",    f"{df['enhanced_oi_gex'].clip(lower=0).sum():.4f}{unit_label}" if 'enhanced_oi_gex' in df.columns else "N/A")
+            eo3.metric("Enh Negative GEX",    f"{df['enhanced_oi_gex'].clip(upper=0).sum():.4f}{unit_label}" if 'enhanced_oi_gex' in df.columns else "N/A")
+            eo4.metric("GEX Flip Zones",      str(len(identify_gamma_flip_zones(df, spot_price))))
+
+        # Tab 2 — Enhanced OI GEX
+        with tabs[2]:
             st.markdown(f"### 🚀 {currency} Enhanced OI GEX")
             st.caption("OI-weighted GEX incorporating Greeks · Volume · IV · Distance. Purple = Positive, Gold = Negative.")
             if 'enhanced_oi_gex' not in df.columns:
@@ -1846,8 +2414,24 @@ def main():
             g2.metric("🟡 Negative OI GEX", f"{df['enhanced_oi_gex'].clip(upper=0).sum():.4f}{unit_label}")
             g3.metric("⚡ Net Enhanced GEX", f"{df['enhanced_oi_gex'].sum():.4f}{unit_label}")
 
-        # Tab 2 — Enhanced VANNA Overlay
-        with tabs[2]:
+        # Tab 3 — Standard VANNA
+        with tabs[3]:
+            st.markdown(f"### \U0001f30a {currency} Standard VANNA")
+            st.markdown("""<div class="spike-legend">
+            <b>VANNA = dDelta/dVol</b> — how a dealer delta hedge changes when IV moves<br>
+            <b>Positive VANNA</b> = IV rises, dealer BUYS delta (bullish force)<br>
+            <b>Negative VANNA</b> = IV rises, dealer SELLS delta (bearish force)
+            </div>""", unsafe_allow_html=True)
+            st.plotly_chart(
+                create_standard_vanna_chart_crypto(df, spot_price, unit_label, currency),
+                use_container_width=True)
+            sv1, sv2, sv3 = st.columns(3)
+            sv1.metric("Call VANNA", f"{df['call_vanna'].sum():.6f}{unit_label}" if 'call_vanna' in df.columns else "N/A")
+            sv2.metric("Put VANNA",  f"{df['put_vanna'].sum():.6f}{unit_label}"  if 'put_vanna'  in df.columns else "N/A")
+            sv3.metric("Net VANNA",  f"{df['net_vanna'].sum():.6f}{unit_label}"  if 'net_vanna'  in df.columns else "N/A")
+
+        # Tab 4 — Enhanced VANNA Overlay
+        with tabs[4]:
             st.markdown(f"### 🌊 {currency} Enhanced VANNA Overlay")
             st.markdown("""<div class="spike-legend">
             🔴 <b style="color:#ef4444">Resistance Ceiling</b> = POS→NEG flip above spot — IV↑ forces dealers to SELL delta<br>
@@ -1927,8 +2511,29 @@ def main():
                             f"{z['role'].replace('_',' ')} "
                             f"({abs(z['strike']-spot_price)/spot_price*100:.1f}% away)")
 
-        # Tab 3 — Cascade Mathematics
-        with tabs[3]:
+        # Tab 5 — Enhanced OI VANNA
+        with tabs[5]:
+            st.markdown(f"### \U0001f30a {currency} Enhanced OI VANNA")
+            st.caption("OI-weighted VANNA x Volume x IV x Distance. Pink = Positive, Deep Pink = Negative.")
+            st.markdown("""<div class="spike-legend">
+            \U0001f534 <b style="color:#ef4444">Resistance Ceiling</b> = POS to NEG flip above spot<br>
+            \U0001f680 <b style="color:#10b981">Vacuum Zone</b> = NEG to POS flip above spot<br>
+            \u26a0\ufe0f <b style="color:#f59e0b">Trap Door</b> = POS to NEG flip below spot<br>
+            \U0001f6e1 <b style="color:#06b6d4">Support Floor</b> = NEG to POS flip below spot
+            </div>""", unsafe_allow_html=True)
+            st.plotly_chart(
+                create_enhanced_oi_vanna_chart_crypto(df, spot_price, unit_label, currency),
+                use_container_width=True)
+            vzones5 = identify_vanna_flip_zones(df, spot_price)
+            ev1, ev2, ev3, ev4, ev5 = st.columns(5)
+            ev1.metric("Total Zones",   len(vzones5))
+            ev2.metric("Vacuum",        sum(1 for z in vzones5 if z['role']=='VACUUM_ZONE'))
+            ev3.metric("Resistance",    sum(1 for z in vzones5 if z['role']=='RESISTANCE_CEILING'))
+            ev4.metric("Trap Doors",    sum(1 for z in vzones5 if z['role']=='TRAP_DOOR'))
+            ev5.metric("Support",       sum(1 for z in vzones5 if z['role']=='SUPPORT_FLOOR'))
+
+        # Tab 6 — Cascade Mathematics
+        with tabs[6]:
             st.markdown(f"### 📐 {currency} Cascade Mathematics")
             st.markdown(
                 '<div style="background:rgba(15,23,42,0.8);border-left:4px solid #8b5cf6;'
@@ -2024,8 +2629,8 @@ def main():
             except Exception:
                 st.info("Fetch data to see dealer flow bias")
 
-        # Tab 4 — IV Smile
-        with tabs[4]:
+        # Tab 7 — IV Smile
+        with tabs[7]:
             st.markdown(f"### 📈 {currency} IV Smile / Skew")
             st.markdown("""<div class="spike-legend">
             📈 <b>IV Skew</b> = Call IV &gt; Put IV → Market pricing upside risk (bullish fear / FOMO)<br>
@@ -2044,8 +2649,8 @@ def main():
                       delta="Call Skew" if skew > 0 else "Put Skew")
             i4.metric("IV Regime",    iv_regime)
 
-        # Tab 5 — OI Distribution
-        with tabs[5]:
+        # Tab 8 — OI Distribution
+        with tabs[8]:
             st.markdown(f"### 📋 {currency} Open Interest Distribution")
             st.plotly_chart(create_oi_chart(df, spot_price, currency),
                             use_container_width=True)
@@ -2056,8 +2661,8 @@ def main():
             o3.metric("P/C Ratio",      f"{pcr:.2f}")
             o4.metric("Max OI Strike",  f"${max_pain:,.0f}")
 
-        # Tab 6 — Intraday Timeline
-        with tabs[6]:
+        # Tab 9 — Intraday Timeline
+        with tabs[9]:
             st.markdown(f"### 📊 {currency} Intraday GEX Evolution")
             history = st.session_state.get('snapshot_history', [])
             if len(history) >= 2:
@@ -2115,8 +2720,8 @@ def main():
                 💡 This is the crypto equivalent of the India dashboard's intraday timeline.
                 """)
 
-        # Tab 7 — Historical Volatility
-        with tabs[7]:
+        # Tab 10 — Historical Volatility
+        with tabs[10]:
             st.markdown(f"### 📉 {currency} Historical Volatility")
             st.markdown("""<div class="spike-legend">
             <b>Realized Volatility</b> = actual price volatility over past 30 days (free from Deribit)<br>
@@ -2127,7 +2732,7 @@ def main():
 
             if st.button("📥 Load Historical Volatility", use_container_width=True, key="load_hist_vol"):
                 with st.spinner(f"Fetching {currency} 30-day realized vol from Deribit..."):
-                    vol_df = get_deribit_historical_iv(currency, selected_expiry)
+                    vol_df = get_delta_historical_iv(currency, selected_expiry)
                     st.session_state['hist_vol_df'] = vol_df
 
             if 'hist_vol_df' in st.session_state and not st.session_state['hist_vol_df'].empty:
@@ -2144,14 +2749,14 @@ def main():
                            delta="Options expensive" if avg_iv > current_rv else "Options cheap",
                            delta_color="inverse" if avg_iv > current_rv else "normal")
             else:
-                st.info("Click **Load Historical Volatility** to fetch 30-day realized vol data.")
+                st.info("Click **Load Historical Volatility** to fetch 30-day realized vol from Delta Exchange India.")
 
             # Settlement prices
             st.markdown("---")
             st.markdown(f"#### 📅 Past {currency} Expiry Settlement Prices")
             if st.button("📥 Load Settlement History", use_container_width=True, key="load_settlement"):
                 with st.spinner("Loading settlement prices..."):
-                    settle_df = get_deribit_historical_settlement(currency, 20)
+                    settle_df = get_delta_historical_settlement(currency, 20)
                     st.session_state['settle_df'] = settle_df
 
             if 'settle_df' in st.session_state and not st.session_state['settle_df'].empty:
@@ -2161,8 +2766,8 @@ def main():
             else:
                 st.info("Click **Load Settlement History** to see past expiry settlement prices.")
 
-        # Tab 8 — Data Table
-        with tabs[8]:
+        # Tab 11 — Data Table
+        with tabs[11]:
             st.markdown(f"### 📁 {currency} Options Data")
             st.markdown(f"""
             **Asset**: {currency} | **Expiry**: {selected_expiry}
