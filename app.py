@@ -268,39 +268,81 @@ def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
     Re-compute Greeks using Black-Scholes for any row where
     gamma or vanna is 0/missing (Deribit sometimes omits these).
     expiry_str format: 10APR26
+    Uses vectorised pandas operations — no df.at[] to avoid index issues.
     """
+    if df.empty:
+        return df
+
+    # Parse TTE
     try:
         exp_dt = datetime.strptime(expiry_str, '%d%b%y')
         tte    = max((exp_dt - datetime.utcnow()).days / 365.0, 1/365)
     except Exception:
-        tte = 7 / 365.0  # default 1 week
+        tte = 7 / 365.0
 
-    rows_enriched = 0
-    for idx, row in df.iterrows():
-        # Enrich if gamma or vanna is zero/missing
-        needs_enrich = (
-            abs(row.get('call_gamma', 0)) < 1e-12 or
-            abs(row.get('call_vanna', 0)) < 1e-12
-        )
-        if needs_enrich:
-            c_iv = row.get('call_iv', 65.0)
-            p_iv = row.get('put_iv',  65.0)
-            # Use ATM IV as fallback if per-strike IV missing
-            if c_iv < 0.1: c_iv = 65.0
-            if p_iv < 0.1: p_iv = 65.0
-            greeks = compute_bs_greeks_for_row(
-                spot_price, row['strike'], tte, c_iv, p_iv)
-            for col, val in greeks.items():
-                df.at[idx, col] = val
-            rows_enriched += 1
+    # Ensure all Greek columns exist
+    for col in ['call_gamma','put_gamma','call_vanna','put_vanna',
+                'call_delta','put_delta']:
+        if col not in df.columns:
+            df[col] = 0.0
 
-    if rows_enriched > 0:
-        # Recompute net GEX / VANNA / DEX with enriched Greeks
-        cs  = 1  # Deribit contract size = 1
-        div = df.attrs.get('unit_divisor', 1e3)
-        df['net_gex']   = (df['call_oi'] * df['call_gamma'] - df['put_oi'] * df['put_gamma']) * spot_price**2 * cs / div
-        df['net_vanna'] = (df['call_oi'] * df['call_vanna'] - df['put_oi'] * df['put_vanna']) * cs / div
-        df['net_dex']   = (df['call_oi'] * df['call_delta'] + df['put_oi'] * df['put_delta']) * cs / div
+    # Reset index to ensure clean integer index for vectorised ops
+    df = df.reset_index(drop=True)
+
+    # IV: use 65% as fallback where missing or near-zero
+    c_iv = df['call_iv'].fillna(65.0).clip(lower=1.0)
+    p_iv = df['put_iv'].fillna(65.0).clip(lower=1.0)
+    c_iv_frac = c_iv / 100.0
+    p_iv_frac = p_iv / 100.0
+
+    S = spot_price
+    K = df['strike']
+    T = tte
+    r = 0.05
+
+    # Vectorised BS Greeks
+    def _safe_d1(iv_frac):
+        denom = iv_frac * np.sqrt(T)
+        denom = denom.replace(0, 1e-10)
+        return (np.log(S / K) + (r + 0.5 * iv_frac**2) * T) / denom
+
+    c_d1 = _safe_d1(c_iv_frac)
+    p_d1 = _safe_d1(p_iv_frac)
+    c_d2 = c_d1 - c_iv_frac * np.sqrt(T)
+    p_d2 = p_d1 - p_iv_frac * np.sqrt(T)
+
+    # Gamma = pdf(d1) / (S * sigma * sqrt(T))
+    c_gamma_bs = norm.pdf(c_d1) / (S * c_iv_frac * np.sqrt(T))
+    p_gamma_bs = norm.pdf(p_d1) / (S * p_iv_frac * np.sqrt(T))
+
+    # Vanna = -pdf(d1) * d2 / sigma
+    c_vanna_bs = -norm.pdf(c_d1) * c_d2 / c_iv_frac
+    p_vanna_bs = -norm.pdf(p_d1) * p_d2 / p_iv_frac
+
+    # Delta
+    c_delta_bs = norm.cdf(c_d1)
+    p_delta_bs = norm.cdf(p_d1) - 1.0
+
+    # Only replace zeros — keep broker-provided values where they exist
+    mask_c_gamma = df['call_gamma'].abs() < 1e-12
+    mask_p_gamma = df['put_gamma'].abs() < 1e-12
+    mask_c_vanna = df['call_vanna'].abs() < 1e-12
+    mask_p_vanna = df['put_vanna'].abs() < 1e-12
+    mask_c_delta = df['call_delta'].abs() < 1e-12
+    mask_p_delta = df['put_delta'].abs() < 1e-12
+
+    df.loc[mask_c_gamma, 'call_gamma'] = c_gamma_bs[mask_c_gamma]
+    df.loc[mask_p_gamma, 'put_gamma']  = p_gamma_bs[mask_p_gamma]
+    df.loc[mask_c_vanna, 'call_vanna'] = c_vanna_bs[mask_c_vanna]
+    df.loc[mask_p_vanna, 'put_vanna']  = p_vanna_bs[mask_p_vanna]
+    df.loc[mask_c_delta, 'call_delta'] = c_delta_bs[mask_c_delta]
+    df.loc[mask_p_delta, 'put_delta']  = p_delta_bs[mask_p_delta]
+
+    # Recompute aggregated metrics with enriched Greeks
+    div = df.attrs.get('unit_divisor', 1e3)
+    df['net_gex']   = (df['call_oi'] * df['call_gamma'] - df['put_oi'] * df['put_gamma']) * S**2 / div
+    df['net_vanna'] = (df['call_oi'] * df['call_vanna'] - df['put_oi'] * df['put_vanna']) / div
+    df['net_dex']   = (df['call_oi'] * df['call_delta'] + df['put_oi'] * df['put_delta']) / div
 
     return df
 
