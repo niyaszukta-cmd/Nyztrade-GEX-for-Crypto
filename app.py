@@ -129,7 +129,7 @@ DELTA_BASE = "https://api.india.delta.exchange"
 CRYPTO_CONFIG = {
     'BTC': {
         'contract_size':   1,
-        'strike_interval': 1000,
+        'strike_interval': 500,    # Delta lists BTC at $500 intervals
         'pts_per_unit':    0.007,
         'strike_cap_pts':  3000,
         'currency':        'BTC',
@@ -141,7 +141,7 @@ CRYPTO_CONFIG = {
     },
     'ETH': {
         'contract_size':   1,
-        'strike_interval': 50,
+        'strike_interval': 25,     # Delta lists ETH at $25 intervals
         'pts_per_unit':    0.005,
         'strike_cap_pts':  200,
         'currency':        'ETH',
@@ -192,6 +192,240 @@ def _load_cache(key: str, max_age: int = 60):
         return d['df'], d['meta']
     except Exception:
         return None, None
+
+# ── Historical Snapshot Store (persistent across sessions) ───────────────────
+import sqlite3
+
+HIST_DB = Path("cache/crypto/gex_history.db")
+
+def _init_history_db():
+    """Create history DB if it doesn't exist."""
+    try:
+        HIST_DB.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(HIST_DB))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gex_snapshots (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                currency    TEXT    NOT NULL,
+                expiry      TEXT    NOT NULL,
+                snapshot_ts TEXT    NOT NULL,
+                spot_price  REAL    NOT NULL,
+                strike      REAL    NOT NULL,
+                call_oi     REAL    DEFAULT 0,
+                put_oi      REAL    DEFAULT 0,
+                call_iv     REAL    DEFAULT 0,
+                put_iv      REAL    DEFAULT 0,
+                call_gamma  REAL    DEFAULT 0,
+                put_gamma   REAL    DEFAULT 0,
+                call_vanna  REAL    DEFAULT 0,
+                put_vanna   REAL    DEFAULT 0,
+                net_gex     REAL    DEFAULT 0,
+                net_vanna   REAL    DEFAULT 0,
+                net_dex     REAL    DEFAULT 0,
+                total_volume REAL   DEFAULT 0,
+                enhanced_oi_gex REAL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_currency_expiry_ts
+            ON gex_snapshots(currency, expiry, snapshot_ts)
+        """)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+def save_snapshot_to_history(df: pd.DataFrame, currency: str,
+                              expiry: str, spot_price: float):
+    """
+    Persist a GEX snapshot to SQLite.
+    Called automatically on every fetch — builds historical database over time.
+    """
+    try:
+        _init_history_db()
+        conn  = sqlite3.connect(str(HIST_DB))
+        ts    = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        cols  = ['strike','call_oi','put_oi','call_iv','put_iv',
+                 'call_gamma','put_gamma','call_vanna','put_vanna',
+                 'net_gex','net_vanna','net_dex','total_volume','enhanced_oi_gex']
+        rows  = []
+        for _, row in df.iterrows():
+            rows.append((
+                currency, expiry, ts, spot_price,
+                *[float(row.get(c, 0) or 0) for c in cols]
+            ))
+        conn.executemany("""
+            INSERT INTO gex_snapshots
+            (currency,expiry,snapshot_ts,spot_price,
+             strike,call_oi,put_oi,call_iv,put_iv,
+             call_gamma,put_gamma,call_vanna,put_vanna,
+             net_gex,net_vanna,net_dex,total_volume,enhanced_oi_gex)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, rows)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        return False
+
+def load_history_snapshots(currency: str, expiry: str,
+                            days_back: int = 30) -> pd.DataFrame:
+    """
+    Load all saved GEX snapshots for a currency+expiry.
+    Returns DataFrame with all historical timestamps — each unique ts
+    is one intraday/interday snapshot.
+    """
+    try:
+        _init_history_db()
+        conn = sqlite3.connect(str(HIST_DB))
+        since = (datetime.utcnow() - timedelta(days=days_back)).strftime('%Y-%m-%d %H:%M:%S')
+        df = pd.read_sql_query("""
+            SELECT * FROM gex_snapshots
+            WHERE currency = ? AND expiry = ? AND snapshot_ts >= ?
+            ORDER BY snapshot_ts ASC
+        """, conn, params=(currency, expiry, since))
+        conn.close()
+        if not df.empty:
+            df['snapshot_ts'] = pd.to_datetime(df['snapshot_ts'])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def get_history_summary(currency: str) -> pd.DataFrame:
+    """Get summary of all stored history: currencies, expiries, snapshot counts."""
+    try:
+        _init_history_db()
+        conn = sqlite3.connect(str(HIST_DB))
+        df = pd.read_sql_query("""
+            SELECT currency, expiry,
+                   COUNT(DISTINCT snapshot_ts) as snapshots,
+                   MIN(snapshot_ts) as first_snapshot,
+                   MAX(snapshot_ts) as last_snapshot,
+                   COUNT(*) as total_rows
+            FROM gex_snapshots
+            WHERE currency = ?
+            GROUP BY currency, expiry
+            ORDER BY last_snapshot DESC
+        """, conn, params=(currency,))
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def delete_old_history(days_keep: int = 90):
+    """Housekeeping — remove snapshots older than N days."""
+    try:
+        conn  = sqlite3.connect(str(HIST_DB))
+        since = (datetime.utcnow() - timedelta(days=days_keep)).strftime('%Y-%m-%d %H:%M:%S')
+        conn.execute("DELETE FROM gex_snapshots WHERE snapshot_ts < ?", (since,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def create_historical_gex_chart(hist_df: pd.DataFrame, metric: str = 'net_gex',
+                                  currency: str = 'BTC',
+                                  unit_label: str = 'K') -> go.Figure:
+    """
+    Chart showing GEX metric evolution across ALL historical snapshots.
+    X-axis = timestamp, Y-axis = total net GEX summed across all strikes.
+    """
+    if hist_df.empty:
+        return go.Figure()
+
+    ts_group = hist_df.groupby('snapshot_ts').agg(
+        metric_sum=(metric, 'sum'),
+        spot_price=('spot_price', 'first'),
+    ).reset_index()
+
+    color = '#10b981' if ts_group['metric_sum'].mean() >= 0 else '#ef4444'
+    bar_colors = ['#10b981' if v >= 0 else '#ef4444' for v in ts_group['metric_sum']]
+
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.65, 0.35],
+        subplot_titles=[
+            f'{currency} {metric.upper()} — Historical Evolution',
+            'Spot Price',
+        ],
+        vertical_spacing=0.08,
+    )
+
+    fig.add_trace(go.Bar(
+        x=ts_group['snapshot_ts'], y=ts_group['metric_sum'],
+        name=f'{metric.upper()} Total',
+        marker_color=bar_colors,
+        hovertemplate='%{x}<br>' + metric + ': %{y:.4f}' + unit_label + '<extra></extra>',
+    ), row=1, col=1)
+
+    fig.add_hline(y=0, line=dict(color='#64748b', width=1), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=ts_group['snapshot_ts'], y=ts_group['spot_price'],
+        name='Spot Price', mode='lines+markers',
+        line=dict(color='#fbbf24', width=2),
+        hovertemplate='%{x}<br>Spot: $%{y:,.2f}<extra></extra>',
+    ), row=2, col=1)
+
+    fig.update_layout(
+        height=600, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        showlegend=True,
+        legend=dict(
+            x=0.01, y=0.99, bgcolor='rgba(15,23,42,0.7)',
+            bordercolor='#2d3748', borderwidth=1,
+        ),
+    )
+    return fig
+
+
+def create_historical_heatmap(hist_df: pd.DataFrame, metric: str = 'net_gex',
+                               currency: str = 'BTC') -> go.Figure:
+    """
+    Heatmap: X=timestamp, Y=strike, Color=GEX value.
+    Shows how dealer positioning evolved across strikes over time.
+    This is the most powerful historical view.
+    """
+    if hist_df.empty:
+        return go.Figure()
+
+    pivot = hist_df.pivot_table(
+        index='strike', columns='snapshot_ts',
+        values=metric, aggfunc='mean'
+    )
+    pivot = pivot.sort_index(ascending=False)
+
+    col_labels = [str(c)[:16] for c in pivot.columns]
+    max_abs    = pivot.abs().values.max() or 1
+
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values,
+        x=col_labels,
+        y=[f"${s:,.0f}" for s in pivot.index],
+        colorscale=[
+            [0,   '#ef4444'],
+            [0.5, '#1a2332'],
+            [1,   '#10b981'],
+        ],
+        zmid=0,
+        zmax=max_abs,
+        zmin=-max_abs,
+        hovertemplate='Time: %{x}<br>Strike: %{y}<br>' + metric + ': %{z:.4f}<extra></extra>',
+        colorbar=dict(title=metric.upper(), tickfont=dict(size=9)),
+    ))
+
+    fig.update_layout(
+        title=f'{currency} {metric.upper()} Heatmap — Strike × Time Evolution',
+        xaxis_title='Snapshot Time', yaxis_title='Strike Price',
+        height=max(500, len(pivot) * 22),
+        template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        margin=dict(l=100, r=80, t=60, b=80),
+    )
+    return fig
 
 # ============================================================================
 # DELTA EXCHANGE INDIA — API LAYER
@@ -2352,6 +2586,8 @@ def main():
                     'total_records': len(df),
                 }
                 _save_cache(cache_key, df, meta)
+                # Auto-save to persistent history DB
+                save_snapshot_to_history(df, currency, selected_expiry, spot_price)
                 st.session_state['crypto_df']   = df
                 st.session_state['crypto_meta'] = meta
                 st.success(f"✅ Fetched {len(df)} strikes for {currency} {selected_expiry}")
@@ -2511,6 +2747,7 @@ def main():
             "📋 OI Distribution",
             "📊 Intraday Timeline",
             "📉 Historical Vol",
+            "🗄️ Historical GEX DB",
             "📁 Data Table",
         ])
 
@@ -2902,8 +3139,149 @@ def main():
             else:
                 st.info("Click **Load Settlement History** to see past expiry settlement prices.")
 
-        # Tab 11 — Data Table
+        # Tab 11 — Historical GEX DB
         with tabs[11]:
+            st.markdown(f"### 🗄️ {currency} Historical GEX Database")
+            st.markdown("""<div class="spike-legend">
+            Every time you fetch options data, it is <b>automatically saved</b> to a local SQLite database.<br>
+            Over time this builds a complete historical record of GEX positioning across sessions.<br>
+            <b>Evolution Chart</b> = Total net GEX over time &nbsp;|&nbsp;
+            <b>Heatmap</b> = Strike × Time showing which walls built or dissolved
+            </div>""", unsafe_allow_html=True)
+
+            # ── History summary ───────────────────────────────────────────
+            hist_summary = get_history_summary(currency)
+            if not hist_summary.empty:
+                st.markdown("#### 📋 Stored Snapshots")
+                st.dataframe(hist_summary, use_container_width=True, hide_index=True)
+            else:
+                st.info(
+                    "No historical data yet for this currency. "
+                    "Each time you click **Fetch Options Chain** the data is saved automatically. "
+                    "Come back after a few fetches across different times/days."
+                )
+
+            st.markdown("---")
+
+            # ── Load historical data ──────────────────────────────────────
+            h_col1, h_col2, h_col3 = st.columns([2, 1, 1])
+            with h_col1:
+                hist_metric = st.selectbox(
+                    "Metric to visualise",
+                    ['net_gex', 'net_vanna', 'net_dex', 'enhanced_oi_gex'],
+                    format_func=lambda x: {
+                        'net_gex':          '📊 Net GEX',
+                        'net_vanna':        '🌊 Net VANNA',
+                        'net_dex':          '📈 Net DEX',
+                        'enhanced_oi_gex':  '🚀 Enhanced OI GEX',
+                    }[x],
+                    key='hist_metric_select'
+                )
+            with h_col2:
+                hist_days = st.slider("Days back", 1, 90, 30, key='hist_days')
+            with h_col3:
+                hist_expiry_filter = st.text_input(
+                    "Expiry filter (blank = current)",
+                    value=selected_expiry,
+                    key='hist_expiry_filter'
+                )
+
+            hist_df = load_history_snapshots(
+                currency,
+                hist_expiry_filter or selected_expiry,
+                days_back=hist_days
+            )
+
+            if not hist_df.empty:
+                n_snaps = hist_df['snapshot_ts'].nunique()
+                n_rows  = len(hist_df)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Snapshots",    n_snaps)
+                m2.metric("Strike Rows",  n_rows)
+                m3.metric("Date Range",   f"{hist_df['snapshot_ts'].min().strftime('%d%b')} – {hist_df['snapshot_ts'].max().strftime('%d%b')}")
+                m4.metric("Spot Range",   f"${hist_df['spot_price'].min():,.0f} – ${hist_df['spot_price'].max():,.0f}")
+
+                st.markdown("---")
+
+                # ── Evolution chart ───────────────────────────────────────
+                st.markdown(f"#### 📈 {hist_metric.upper()} Evolution Over Time")
+                evo_fig = create_historical_gex_chart(
+                    hist_df, hist_metric, currency, unit_label)
+                st.plotly_chart(evo_fig, use_container_width=True)
+
+                # ── Heatmap ───────────────────────────────────────────────
+                st.markdown(f"#### 🔥 Strike × Time Heatmap — {hist_metric.upper()}")
+                st.caption("Green = Positive (bullish wall) | Red = Negative (bear fuel) | Watch how walls build and dissolve over time")
+                heatmap_fig = create_historical_heatmap(hist_df, hist_metric, currency)
+                st.plotly_chart(heatmap_fig, use_container_width=True)
+
+                # ── Key level evolution table ─────────────────────────────
+                st.markdown("#### 📋 Max GEX Strike per Snapshot")
+                ts_groups = hist_df.groupby('snapshot_ts')
+                summary_rows = []
+                for ts, grp in ts_groups:
+                    if grp.empty:
+                        continue
+                    max_pos_idx = grp['net_gex'].idxmax()
+                    max_neg_idx = grp['net_gex'].idxmin()
+                    summary_rows.append({
+                        'Time (UTC)':     ts.strftime('%Y-%m-%d %H:%M'),
+                        'Spot':           f"${grp['spot_price'].iloc[0]:,.2f}",
+                        'Total Net GEX':  f"{grp['net_gex'].sum():+.4f}{unit_label}",
+                        'Biggest Wall':   f"${grp.loc[max_pos_idx,'strike']:,.0f} (+{grp.loc[max_pos_idx,'net_gex']:.3f}{unit_label})",
+                        'Biggest Fuel':   f"${grp.loc[max_neg_idx,'strike']:,.0f} ({grp.loc[max_neg_idx,'net_gex']:.3f}{unit_label})",
+                    })
+                if summary_rows:
+                    st.dataframe(
+                        pd.DataFrame(summary_rows),
+                        use_container_width=True, hide_index=True
+                    )
+
+                # ── Export ────────────────────────────────────────────────
+                st.markdown("---")
+                exp1, exp2 = st.columns(2)
+                with exp1:
+                    st.download_button(
+                        "📥 Download Full History (CSV)",
+                        data=hist_df.to_csv(index=False),
+                        file_name=f"nyztrade_{currency}_{hist_expiry_filter}_history.csv",
+                        mime="text/csv", use_container_width=True,
+                    )
+                with exp2:
+                    if st.button("🗑️ Clear History for This Expiry",
+                                 use_container_width=True, key='clear_hist'):
+                        try:
+                            conn = sqlite3.connect(str(HIST_DB))
+                            conn.execute(
+                                "DELETE FROM gex_snapshots WHERE currency=? AND expiry=?",
+                                (currency, hist_expiry_filter or selected_expiry)
+                            )
+                            conn.commit(); conn.close()
+                            st.success("History cleared for this expiry.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            else:
+                st.info(
+                    f"No history found for {currency} {hist_expiry_filter or selected_expiry} "
+                    f"in the last {hist_days} days.\n\n"
+                    "Fetch data a few times across different timestamps to start building history."
+                )
+
+            # ── DB housekeeping ───────────────────────────────────────────
+            with st.expander("⚙️ Database Housekeeping"):
+                keep_days = st.slider("Keep snapshots for N days", 7, 180, 90)
+                if st.button("🧹 Delete Old Snapshots", use_container_width=True):
+                    delete_old_history(keep_days)
+                    st.success(f"Deleted snapshots older than {keep_days} days.")
+                try:
+                    db_size = HIST_DB.stat().st_size / 1024 / 1024 if HIST_DB.exists() else 0
+                    st.caption(f"DB size: {db_size:.2f} MB | Location: {HIST_DB}")
+                except Exception:
+                    pass
+
+        # Tab 12 — Data Table
+        with tabs[12]:
             st.markdown(f"### 📁 {currency} Options Data")
             st.markdown(f"""
             **Asset**: {currency} | **Expiry**: {selected_expiry}
