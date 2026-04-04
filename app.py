@@ -128,9 +128,11 @@ DELTA_BASE = "https://api.india.delta.exchange"
 CRYPTO_CONFIG = {
     'BTC': {
         'contract_size':   1,
-        'strike_interval': 500,    # Delta lists BTC at $500 intervals
-        'pts_per_unit':    0.007,
-        'strike_cap_pts':  3000,
+        'strike_interval': 1000,   # Delta Exchange India: BTC weekly at $1000 intervals
+        # Calibration: dominant GEX ~300,000K → $500 forced move
+        # 500/300000 = 0.00167. Use 0.002 (gives 600pts → capped at 1500)
+        'pts_per_unit':    0.002,
+        'strike_cap_pts':  1500,      # BTC $500-1500 per major wall
         'currency':        'BTC',
         'delta_symbol':    'BTCUSD',   # Delta Exchange ticker symbol
         'unit_label':      'K',
@@ -140,9 +142,11 @@ CRYPTO_CONFIG = {
     },
     'ETH': {
         'contract_size':   1,
-        'strike_interval': 25,     # Delta lists ETH at $25 intervals
-        'pts_per_unit':    0.005,
-        'strike_cap_pts':  200,
+        'strike_interval': 50,    # Delta Exchange India: ETH at $50 intervals (confirmed)
+        # Calibration: dominant GEX ~2863K → $72 forced move
+        # 75/2863 = 0.026. Use 0.025
+        'pts_per_unit':    0.025,
+        'strike_cap_pts':  150,       # ETH $75-150 per major strike
         'currency':        'ETH',
         'delta_symbol':    'ETHUSD',
         'unit_label':      'K',
@@ -153,8 +157,10 @@ CRYPTO_CONFIG = {
     'XAU': {
         'contract_size':   1,
         'strike_interval': 25,
-        'pts_per_unit':    0.008,
-        'strike_cap_pts':  100,
+        # Gold spot ~$3100, $25 intervals, typical GEX ~500K
+        # 500K × 0.010 = $5 per strike → cap $25 for gold
+        'pts_per_unit':    0.010,
+        'strike_cap_pts':  25,    # Gold moves $10-25 per major level
         'currency':        'XAU',
         'delta_symbol':    'XAUUSD',
         'unit_label':      'K',
@@ -2953,16 +2959,17 @@ def main():
             # ── GEX ↔ Price Move Calculator ──────────────────────────────
             st.markdown("---")
             st.markdown("#### ⚡ GEX ↔ Price Move Calculator")
-            gex_per_1000 = 1000 / cfg['pts_per_unit']
+            # GEX needed to force a $100 move on this asset
+            gex_per_100pts = 100 / cfg['pts_per_unit']
             calc_c1, calc_c2, calc_c3 = st.columns(3)
             calc_c1.metric(
-                f"GEX needed for $1,000 move",
-                f"{gex_per_1000:,.0f}K",
-                help=f"Calibrated for {currency}: {gex_per_1000:,.0f}K GEX release = $1,000 forced move"
+                f"GEX needed for $100 move",
+                f"{gex_per_100pts:,.0f}K",
+                help=f"Calibrated for {currency}: {gex_per_100pts:,.0f}K GEX release = $100 forced move"
             )
             calc_c2.metric(
                 f"$ move per 1K GEX released",
-                f"${cfg['pts_per_unit'] * 1000:.2f}",
+                f"${cfg['pts_per_unit'] * 1000:.3f}",
                 help=f"Each 1K of GEX released → ${cfg['pts_per_unit']*1000:.2f} on {currency}"
             )
             calc_c3.metric(
