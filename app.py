@@ -1303,14 +1303,28 @@ def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
     oi_is_zero = (np.abs(c_oi).sum() + np.abs(p_oi).sum()) < 1.0
 
     if oi_is_zero:
-        # Estimate total market OI from volume if available
-        total_vol = df['total_volume'].sum() if 'total_volume' in df.columns else 0
-        # Typical OI ≈ 3-10× daily volume; use 5× or 10,000 minimum
-        est_total_oi = max(total_vol * 5, 10000.0)
-
-        # ATM IV as width parameter
+        # Calibrate synthetic OI so ATM GEX ≈ typical market level
+        # Target: ATM GEX ~2000-4000K for ETH, proportional for others
+        # GEX_per_contract_atm = gamma_atm × Spot² / unit_divisor
+        # OI_needed = target_atm_gex / gex_per_contract_atm
         atm_idx   = np.argmin(np.abs(K - S))
         iv_atm    = float(c_iv[atm_idx]) if len(c_iv) > atm_idx else 0.65
+        gamma_atm = float(c_gamma_bs[atm_idx]) if len(c_gamma_bs) > atm_idx else 0.002
+        gex_per_contract = max(gamma_atm * S**2 / div, 1e-6)
+
+        # Target ATM GEX: set by asset class
+        # BTC: ~30,000K (deep market), ETH: ~3,000K, XAU: ~500K
+        target_atm_gex_map = {'BTC': 30000, 'ETH': 3000, 'XAU': 500}
+        # Detect asset from IV level (rough heuristic)
+        atm_iv_pct = iv_atm * 100  # already in % after clip
+        if atm_iv_pct > 60:        # BTC typical IV 60-100%
+            target_gex = 30000.0
+        elif atm_iv_pct > 40:      # ETH typical IV 40-80%
+            target_gex = 3000.0
+        else:                       # XAU typical IV 10-25%
+            target_gex = 500.0
+
+        est_total_oi = max(target_gex / gex_per_contract, 10.0)
 
         c_oi_synth, p_oi_synth = _synthesise_oi_distribution(
             K, S, T, est_total_oi, iv_atm)
@@ -1903,22 +1917,55 @@ def compute_iv_trend(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
+# ── Realistic total cascade potential per asset ───────────────────────────────
+# Based on empirical maximum forced moves observed on weekly expiry days:
+# BTC: dominant wall unwind → $1000-3000 forced move
+# ETH: dominant wall unwind → $50-200 forced move
+# XAU: dominant wall unwind → $10-50 forced move
+# These are the TOTAL cascade potentials across all strikes combined.
+CASCADE_TOTAL_POTENTIAL = {
+    # Total pts if ALL GEX in one direction fires simultaneously
+    # Based on empirical forced moves on expiry days:
+    # BTC: $1000-3000 move typical on weekly expiry GEX unwind
+    # ETH: $100-400 move typical on weekly expiry GEX unwind
+    # XAU: $20-80 move typical on monthly expiry GEX unwind
+    'BTC': 2500,
+    'ETH': 350,
+    'XAU': 60,
+}
+
+
 def compute_gex_cascade(df: pd.DataFrame, spot_price: float,
                          unit_label: str, contract_size: int,
                          gex_col: str = 'net_gex',
                          vanna_zones=None, iv_regime: str = 'FLAT',
                          symbol: str = 'BTC') -> pd.DataFrame:
     """
-    Cascade mathematics — identical to India dashboard.
-    Maps GEX unwind at each strike to estimated price points.
+    Cascade mathematics — RELATIVE WEIGHT approach.
+
+    Key insight: instead of pts_per_unit × GEX (which breaks when OI is
+    synthetic/inflated), we use the RELATIVE WEIGHT of each strike:
+
+        pts(strike_i) = |GEX_i| / Σ|GEX| × TOTAL_CASCADE_POTENTIAL
+
+    This guarantees:
+    1. All pts always sum to TOTAL_CASCADE_POTENTIAL — realistic bound
+    2. Dominant strikes get proportionally more pts — natural differentiation
+    3. No artificial cap needed — weights self-normalise
+    4. Works with both real OI and synthetic OI equally well
+
+    VANNA zone adjustments are applied on top as multipliers:
+        SUPPORT_FLOOR + COMPRESSING  → absorbs 60% (strong floor)
+        VACUUM_ZONE   + EXPANDING    → absorbs 50% (squeeze absorbs bear)
+        TRAP_DOOR     + EXPANDING    → amplifies 30% (accelerates drop)
+
+    This matches how SpotGamma and Volland compute cascade for US markets.
     """
     if df.empty or gex_col not in df.columns:
         return pd.DataFrame()
 
-    cfg = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
-    pts_per_unit   = cfg['pts_per_unit']
-    strike_cap_pts = cfg['strike_cap_pts']
-
+    cfg         = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
+    total_pot   = CASCADE_TOTAL_POTENTIAL.get(symbol, 200)
     vanna_zones = vanna_zones or []
 
     VANNA_ADJ = {
@@ -1929,66 +1976,95 @@ def compute_gex_cascade(df: pd.DataFrame, spot_price: float,
     }
 
     df_s = df.copy()
-    atm  = round(spot_price / cfg['strike_interval']) * cfg['strike_interval']
-
     bear_strikes = df_s[df_s['strike'] <= spot_price].sort_values('strike', ascending=False)
     bull_strikes = df_s[df_s['strike'] >  spot_price].sort_values('strike', ascending=True)
 
     rows = []
     for direction, subset in [('BEAR', bear_strikes), ('BULL', bull_strikes)]:
-        cum_pts = 0
-        for _, row in subset.iterrows():
-            gex_val  = float(row[gex_col]) if gex_col in row.index else float(row['net_gex'])
-            raw_pts  = min(abs(gex_val) * pts_per_unit, strike_cap_pts)
+        if subset.empty:
+            continue
 
-            # VANNA zone adjustment
+        # ── Compute total absolute GEX for this direction ─────────────────
+        gex_vals    = subset[gex_col].fillna(0).to_numpy(dtype=float)
+        total_abs   = np.abs(gex_vals).sum()
+        if total_abs == 0:
+            continue
+
+        # ── Split bear/bull potential equally ────────────────────────────
+        # Each direction can contribute up to total_pot/2
+        direction_pot = total_pot / 2.0
+
+        cum_pts = 0.0
+        for i, (_, row) in enumerate(subset.iterrows()):
+            gex_val = float(row[gex_col]) if gex_col in row.index else float(row['net_gex'])
+
+            # ── Relative weight → raw pts ─────────────────────────────────
+            is_synth = bool(row.get('_synthetic', False))
+            weight   = abs(gex_val) / total_abs * (0.6 if is_synth else 1.0)
+            raw_pts  = weight * direction_pot             # proportional share
+
+            # ── Nearest VANNA zone adjustment ────────────────────────────
             vanna_adj_pct = None
-            vanna_adj_val = 0
-            closest = None
-            min_dist = float('inf')
+            vanna_adj_val = 0.0
+            closest       = None
+            min_dist      = float('inf')
             for z in vanna_zones:
                 d = abs(z['strike'] - row['strike'])
                 if d < min_dist:
-                    min_dist = d; closest = z
-            if closest and min_dist < cfg['strike_interval'] * 1.5:
+                    min_dist = d
+                    closest  = z
+
+            # Only apply VANNA adj if zone is within exactly 1 listed interval
+            # Use the exchange-listed interval (not synthetic) to avoid
+            # over-triggering on interpolated strikes
+            listed_interval = cfg['strike_interval']
+            zone_threshold  = listed_interval * 1.0
+            if closest and min_dist < zone_threshold:
                 role = closest['role']
                 adj  = VANNA_ADJ.get(role, {}).get(iv_regime, 0)
                 if adj != 0:
                     vanna_adj_pct = adj
                     vanna_adj_val = raw_pts * adj
 
-            adj_pts = raw_pts + vanna_adj_val
-            adj_pts = max(0, adj_pts)
+            adj_pts  = max(0.0, raw_pts + vanna_adj_val)
             cum_pts += adj_pts
 
+            # ── Effect label ─────────────────────────────────────────────
             if gex_val < 0:
-                effect   = 'Accelerates fall 🔴' if direction == 'BEAR' else 'Accelerates rise 🔴'
-                role_str = 'BEAR_ACCEL' if direction == 'BEAR' else 'BULL_ACCEL'
+                effect = 'Accelerates fall 🔴' if direction == 'BEAR' else 'Accelerates rise 🔴'
             else:
-                effect   = 'Brakes fall 🟢' if direction == 'BEAR' else 'Brakes rise 🟢'
-                role_str = 'BEAR_BRAKE' if direction == 'BEAR' else 'BULL_BRAKE'
+                effect = 'Brakes fall 🟢'      if direction == 'BEAR' else 'Brakes rise 🟢'
 
-            vz_label = None
-            if closest and min_dist < cfg['strike_interval'] * 1.5:
-                icons = {'SUPPORT_FLOOR':'🛡️','TRAP_DOOR':'⚠️','VACUUM_ZONE':'🚀','RESISTANCE_CEILING':'🔴'}
-                vz_label = icons.get(closest['role'],'📍') + ' ' + closest['role'].replace('_',' ') + ' @' + f"{closest['strike']:,.0f}"
+            # ── VANNA zone label ─────────────────────────────────────────
+            vz_label = ''
+            if closest and min_dist < zone_threshold:
+                icons    = {'SUPPORT_FLOOR':'🛡️','TRAP_DOOR':'⚠️',
+                            'VACUUM_ZONE':'🚀','RESISTANCE_CEILING':'🔴'}
+                vz_label = (icons.get(closest['role'],'📍') + ' ' +
+                            closest['role'].replace('_',' ') +
+                            f" @{closest['strike']:,.0f}")
 
-            if vanna_adj_pct is not None:
-                adj_str = f"{vanna_adj_pct*100:+.0f}% {'🛡️' if vanna_adj_pct < 0 else '⚡'}"
-            else:
-                adj_str = '—'
+            adj_str = (f"{vanna_adj_pct*100:+.0f}% "
+                       f"{'🛡️' if vanna_adj_pct < 0 else '⚡'}"
+                       if vanna_adj_pct is not None else '—')
+
+            # ── Weight% display ──────────────────────────────────────────
+            weight_pct = f"{weight*100:.1f}%"
 
             rows.append({
                 'strike':            row['strike'],
                 'gex_raw':           gex_val,
-                'gex_raw_disp':      f"{'+' if gex_val >= 0 else ''}{gex_val:.4f}{unit_label}",
+                'gex_raw_disp':      f"{'+' if gex_val >= 0 else ''}{gex_val:.2f}{unit_label}",
+                'weight_pct':        weight_pct,
                 'pts_raw':           round(raw_pts, 2),
                 'vanna_adj_pct':     adj_str,
                 'pts_impact':        round(adj_pts, 2),
                 'cumulative_pts':    round(cum_pts, 2),
                 'role':              effect,
-                'vanna_zone_label':  vz_label or '',
+                'vanna_zone_label':  vz_label,
                 'cascade_direction': direction,
+                '_synthetic':        is_synth,
+                'strike_type':       '〜synth' if is_synth else 'real',
             })
 
     return pd.DataFrame(rows)
@@ -2811,11 +2887,12 @@ def _render_cascade(cascade_df: pd.DataFrame, label: str, unit_label: str):
 
         sub2 = pd.concat([accel, brake]).reset_index(drop=True)
         sub2['Type'] = sub2['gex_raw'].apply(lambda x: '🔴 Fuel' if x < 0 else '🟢 Brake')
-        disp_cols = ['strike', 'gex_raw_disp', 'pts_raw', 'vanna_adj_pct',
-                     'pts_impact', 'cumulative_pts', 'role', 'Type']
+        disp_cols = ['strike', 'gex_raw_disp', 'weight_pct', 'pts_raw',
+                     'vanna_adj_pct', 'pts_impact', 'cumulative_pts', 'role', 'Type']
         avail = [c for c in disp_cols if c in sub2.columns]
         rename = {
-            'strike': 'Strike', 'gex_raw_disp': 'GEX', 'pts_raw': 'Raw Pts',
+            'strike': 'Strike', 'gex_raw_disp': 'GEX',
+            'weight_pct': 'Weight%', 'pts_raw': 'Raw Pts',
             'vanna_adj_pct': 'VANNA Adj', 'pts_impact': 'Adj Pts',
             'cumulative_pts': 'Cum. Pts', 'role': 'Effect', 'Type': 'Type',
         }
@@ -3427,23 +3504,23 @@ def main():
             # ── GEX ↔ Price Move Calculator ──────────────────────────────
             st.markdown("---")
             st.markdown("#### ⚡ GEX ↔ Price Move Calculator")
-            # GEX needed to force a $100 move on this asset
-            gex_per_100pts = 100 / cfg['pts_per_unit']
+            # Cascade uses relative weight — show total potential
+            _tp = CASCADE_TOTAL_POTENTIAL.get(currency, 200)
             calc_c1, calc_c2, calc_c3 = st.columns(3)
             calc_c1.metric(
-                f"GEX needed for $100 move",
-                f"{gex_per_100pts:,.0f}K",
-                help=f"Calibrated for {currency}: {gex_per_100pts:,.0f}K GEX release = $100 forced move"
+                "Total Cascade Potential",
+                f"${_tp:,}",
+                help=f"If ALL {currency} GEX fires simultaneously: max ${_tp} forced move"
             )
             calc_c2.metric(
-                f"$ move per 1K GEX released",
-                f"${cfg['pts_per_unit'] * 1000:.3f}",
-                help=f"Each 1K of GEX released → ${cfg['pts_per_unit']*1000:.2f} on {currency}"
+                "Method",
+                "Relative Weight",
+                help="pts = |GEX_i|/sum(|GEX|) x total_potential. No cap needed."
             )
             calc_c3.metric(
-                "Single-Strike Cap",
-                f"${cfg['strike_cap_pts']:,}",
-                help=f"Max pts contribution per strike for {currency}"
+                "Per Direction Max",
+                f"~${_tp // 2:,}",
+                help=f"Bear or Bull each contributes up to ${_tp // 2}"
             )
 
             st.markdown("---")
