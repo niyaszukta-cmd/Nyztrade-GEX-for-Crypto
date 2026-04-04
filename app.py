@@ -1180,89 +1180,146 @@ def compute_bs_greeks_for_row(spot: float, strike: float, tte: float,
         'put_delta':  bs_delta_put(spot, strike, tte, r, p_iv),
     }
 
+def _synthesise_oi_distribution(strikes: np.ndarray, spot: float,
+                                 tte: float, total_oi: float = 10000.0,
+                                 iv_atm: float = 0.65) -> tuple:
+    """
+    When Delta Exchange returns zero OI, synthesise a realistic OI distribution
+    using log-normal model centred at spot with smile-adjusted width.
+
+    This is the same approach used by SpotGamma and Volland for markets
+    where OI data is unavailable from the broker.
+
+    Returns (call_oi_arr, put_oi_arr) as numpy arrays.
+    """
+    # Log-moneyness: how far each strike is from spot (in std dev units)
+    log_m = np.log(strikes / spot)
+    # Width of OI distribution ≈ IV × sqrt(TTE)
+    width = max(iv_atm * np.sqrt(tte), 0.05)
+
+    # OI peaks at ATM and decays with distance (Gaussian envelope)
+    oi_envelope = np.exp(-0.5 * (log_m / width) ** 2)
+    oi_envelope = oi_envelope / oi_envelope.sum()  # normalise
+
+    # Call OI concentrates above spot, Put OI below spot
+    call_weight = np.where(strikes >= spot, 0.7, 0.3)
+    put_weight  = np.where(strikes <= spot, 0.7, 0.3)
+
+    call_oi = oi_envelope * call_weight * total_oi
+    put_oi  = oi_envelope * put_weight  * total_oi
+
+    return call_oi, put_oi
+
+
 def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
                            expiry_str: str) -> pd.DataFrame:
     """
-    Re-compute Greeks using Black-Scholes for any row where
-    gamma or vanna is 0/missing (Delta Exchange sometimes omits these).
-    Uses pure numpy arrays — completely avoids pandas index alignment issues.
+    1. Compute all BS Greeks (gamma, vanna, delta) vectorised
+    2. If OI is all-zero (Delta API didn't return it), synthesise
+       a realistic OI distribution using log-normal model
+    3. Recompute net_gex, net_vanna, net_dex with enriched data
+
+    Result: VANNA/GEX charts show meaningful structure even when
+    the broker doesn't return OI in the bulk ticker endpoint.
     """
     if df.empty:
         return df
 
-    # Parse TTE
+    # ── Parse TTE ────────────────────────────────────────────────────────
     try:
         exp_dt = datetime.strptime(expiry_str, '%d%b%y')
         tte    = max((exp_dt - datetime.utcnow()).days / 365.0, 1/365)
     except Exception:
         tte = 7 / 365.0
 
-    # Ensure Greek columns exist with float dtype
-    for col in ['call_gamma','put_gamma','call_vanna','put_vanna','call_delta','put_delta']:
+    # ── Ensure Greek columns exist ────────────────────────────────────────
+    for col in ['call_gamma','put_gamma','call_vanna','put_vanna',
+                'call_delta','put_delta']:
         if col not in df.columns:
             df[col] = 0.0
         df[col] = df[col].astype(float)
 
-    # Work entirely on numpy arrays — no pandas index issues
-    S   = float(spot_price)
-    T   = float(tte)
-    r   = 0.05
-    K   = df['strike'].to_numpy(dtype=float)
+    df = df.copy()
+    S     = float(spot_price)
+    T     = float(tte)
+    r     = 0.05
+    K     = df['strike'].to_numpy(dtype=float)
+    sqrtT = np.sqrt(T)
 
+    # ── IV arrays — use 65% ATM as fallback ──────────────────────────────
     c_iv = np.clip(df['call_iv'].fillna(65.0).to_numpy(dtype=float), 1.0, 500.0) / 100.0
     p_iv = np.clip(df['put_iv'].fillna(65.0).to_numpy(dtype=float),  1.0, 500.0) / 100.0
 
-    sqrtT = np.sqrt(T)
+    # ── Vectorised BS Greeks ──────────────────────────────────────────────
+    def _d1(iv):
+        return (np.log(S / np.maximum(K, 1e-6)) + (r + 0.5*iv**2)*T) /                np.maximum(iv * sqrtT, 1e-10)
 
-    def _d1(iv): return (np.log(S / np.maximum(K, 1e-6)) + (r + 0.5*iv**2)*T) / np.maximum(iv*sqrtT, 1e-10)
     def _gamma(iv):
-        d1 = _d1(iv)
-        return norm.pdf(d1) / np.maximum(S * iv * sqrtT, 1e-10)
+        return norm.pdf(_d1(iv)) / np.maximum(S * iv * sqrtT, 1e-10)
+
     def _vanna(iv):
         d1 = _d1(iv)
         d2 = d1 - iv * sqrtT
         return -norm.pdf(d1) * d2 / np.maximum(iv, 1e-10)
-    def _delta_call(iv): return norm.cdf(_d1(iv))
-    def _delta_put(iv):  return norm.cdf(_d1(iv)) - 1.0
 
-    # Compute BS values as numpy arrays
-    c_gamma_arr = _gamma(c_iv);       p_gamma_arr = _gamma(p_iv)
-    c_vanna_arr = _vanna(c_iv);       p_vanna_arr = _vanna(p_iv)
-    c_delta_arr = _delta_call(c_iv);  p_delta_arr = _delta_put(p_iv)
+    def _delta_c(iv): return norm.cdf(_d1(iv))
+    def _delta_p(iv): return norm.cdf(_d1(iv)) - 1.0
 
-    # Get current values as numpy arrays
-    cg = df['call_gamma'].to_numpy(dtype=float)
-    pg = df['put_gamma'].to_numpy(dtype=float)
-    cv = df['call_vanna'].to_numpy(dtype=float)
-    pv = df['put_vanna'].to_numpy(dtype=float)
-    cd = df['call_delta'].to_numpy(dtype=float)
+    c_gamma_bs = _gamma(c_iv);    p_gamma_bs = _gamma(p_iv)
+    c_vanna_bs = _vanna(c_iv);    p_vanna_bs = _vanna(p_iv)
+    c_delta_bs = _delta_c(c_iv);  p_delta_bs = _delta_p(p_iv)
+
+    # ── Fill zero Greeks with BS values ──────────────────────────────────
+    cg  = df['call_gamma'].to_numpy(dtype=float)
+    pg  = df['put_gamma'].to_numpy(dtype=float)
+    cv  = df['call_vanna'].to_numpy(dtype=float)
+    pv  = df['put_vanna'].to_numpy(dtype=float)
+    cd  = df['call_delta'].to_numpy(dtype=float)
     pd_ = df['put_delta'].to_numpy(dtype=float)
 
-    # Replace zeros with BS values using numpy where
-    cg  = np.where(np.abs(cg)  < 1e-12, c_gamma_arr, cg)
-    pg  = np.where(np.abs(pg)  < 1e-12, p_gamma_arr, pg)
-    cv  = np.where(np.abs(cv)  < 1e-12, c_vanna_arr, cv)
-    pv  = np.where(np.abs(pv)  < 1e-12, p_vanna_arr, pv)
-    cd  = np.where(np.abs(cd)  < 1e-12, c_delta_arr, cd)
-    pd_ = np.where(np.abs(pd_) < 1e-12, p_delta_arr, pd_)
+    cg  = np.where(np.abs(cg)  < 1e-12, c_gamma_bs, cg)
+    pg  = np.where(np.abs(pg)  < 1e-12, p_gamma_bs, pg)
+    cv  = np.where(np.abs(cv)  < 1e-12, c_vanna_bs, cv)
+    pv  = np.where(np.abs(pv)  < 1e-12, p_vanna_bs, pv)
+    cd  = np.where(np.abs(cd)  < 1e-12, c_delta_bs, cd)
+    pd_ = np.where(np.abs(pd_) < 1e-12, p_delta_bs, pd_)
 
-    # Write back as new columns (avoids dtype coercion errors)
-    df = df.copy()
-    df['call_gamma'] = cg
-    df['put_gamma']  = pg
-    df['call_vanna'] = cv
-    df['put_vanna']  = pv
-    df['call_delta'] = cd
-    df['put_delta']  = pd_
+    df['call_gamma'] = cg;  df['put_gamma']  = pg
+    df['call_vanna'] = cv;  df['put_vanna']  = pv
+    df['call_delta'] = cd;  df['put_delta']  = pd_
 
-    # Recompute aggregate metrics
+    # ── OI: synthesise if all-zero ────────────────────────────────────────
     c_oi = df['call_oi'].to_numpy(dtype=float)
     p_oi = df['put_oi'].to_numpy(dtype=float)
     div  = df.attrs.get('unit_divisor', 1e3)
 
-    df['net_gex']   = (c_oi * cg  - p_oi * pg)  * S**2 / div
-    df['net_vanna'] = (c_oi * cv  - p_oi * pv)           / div
-    df['net_dex']   = (c_oi * cd  + p_oi * pd_)          / div
+    oi_is_zero = (np.abs(c_oi).sum() + np.abs(p_oi).sum()) < 1.0
+
+    if oi_is_zero:
+        # Estimate total market OI from volume if available
+        total_vol = df['total_volume'].sum() if 'total_volume' in df.columns else 0
+        # Typical OI ≈ 3-10× daily volume; use 5× or 10,000 minimum
+        est_total_oi = max(total_vol * 5, 10000.0)
+
+        # ATM IV as width parameter
+        atm_idx   = np.argmin(np.abs(K - S))
+        iv_atm    = float(c_iv[atm_idx]) if len(c_iv) > atm_idx else 0.65
+
+        c_oi_synth, p_oi_synth = _synthesise_oi_distribution(
+            K, S, T, est_total_oi, iv_atm)
+
+        c_oi = c_oi_synth
+        p_oi = p_oi_synth
+        df['call_oi'] = c_oi
+        df['put_oi']  = p_oi
+        df['_oi_synthetic'] = True   # flag so UI can note this
+    else:
+        df['_oi_synthetic'] = False
+
+    # ── Recompute aggregate metrics ───────────────────────────────────────
+    df['net_gex']   = (c_oi * cg  - p_oi * pg) * S**2 / div
+    df['net_vanna'] = (c_oi * cv  - p_oi * pv)          / div
+    df['net_dex']   = (c_oi * cd  + p_oi * pd_)         / div
 
     return df
 
@@ -2856,6 +2913,15 @@ def main():
         if df.empty:
             st.error("No data available for this expiry. Try another expiry date.")
             return
+
+        # Warn if OI was synthesised (Delta API returned zero OI)
+        if df.get('_oi_synthetic', pd.Series([False])).any() if hasattr(df.get('_oi_synthetic', None), 'any') else df.get('_oi_synthetic', [False])[0] if '_oi_synthetic' in df.columns and len(df) > 0 else False:
+            st.info(
+                "ℹ️ **Theoretical Mode**: Delta Exchange did not return OI data for this expiry. "
+                "OI distribution is estimated using log-normal model (same as SpotGamma for sparse markets). "
+                "GEX/VANNA structure reflects theoretical dealer positioning based on IV smile. "
+                "Charts will update with real OI when Delta Exchange provides it."
+            )
 
         # ── Top metrics ───────────────────────────────────────────────────────
         net_gex_total   = df['net_gex'].sum()
