@@ -122,7 +122,14 @@ st.markdown("""
 #   DELTA_API_SECRET = "your_api_secret"
 # ============================================================================
 
-DELTA_BASE = "https://api.india.delta.exchange"
+DELTA_BASE   = "https://api.india.delta.exchange"
+DERIBIT_BASE = "https://www.deribit.com/api/v2"
+
+# Data source labels
+DATA_SOURCES = {
+    'delta':   '🇮🇳 Delta Exchange India',
+    'deribit': '🌍 Deribit (Global)',
+}
 
 # ── Contract Specs ──────────────────────────────────────────────────────────
 CRYPTO_CONFIG = {
@@ -1478,6 +1485,192 @@ def get_spot_price(currency: str) -> float:
     return delta_get_spot_price(currency)
 
 # ============================================================================
+# DERIBIT — GLOBAL OPTIONS DATA
+# Public API — no auth needed for market data
+# Supports: BTC, ETH, XAU (Gold), SOL, USDC options
+# Docs: https://docs.deribit.com
+# ============================================================================
+
+def deribit_get(method: str, params: dict = None) -> dict:
+    """Generic Deribit public GET — no auth needed."""
+    url = f"{DERIBIT_BASE}/public/{method}"
+    try:
+        r = requests.get(url, params=params or {}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return data.get('result', {})
+    except Exception:
+        return {}
+
+
+def deribit_get_expiries(currency: str) -> list:
+    """Return sorted expiry list from Deribit for a currency."""
+    result = deribit_get("get_instruments", {
+        "currency": currency,
+        "kind":     "option",
+        "expired":  False,
+    })
+    if not isinstance(result, list):
+        return []
+    expiries = set()
+    for ins in result:
+        parts = ins.get('instrument_name', '').split('-')
+        if len(parts) >= 2:
+            expiries.add(parts[1])
+    return sorted(expiries)
+
+
+def deribit_get_spot_price(currency: str) -> float:
+    """Get spot price from Deribit index."""
+    index_map = {'BTC': 'btc_usd', 'ETH': 'eth_usd', 'XAU': 'xau_usd'}
+    index_name = index_map.get(currency, f"{currency.lower()}_usd")
+    result = deribit_get("get_index_price", {"index_name": index_name})
+    price = float(result.get('index_price', 0) or 0)
+    fallbacks = {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}
+    return price if price > 0 else fallbacks.get(currency, 0.0)
+
+
+def fetch_options_chain_deribit(currency: str, expiry: str,
+                                 spot_price: float,
+                                 atm_range: int = 12) -> pd.DataFrame:
+    """
+    Fetch full options chain from Deribit.
+    Deribit provides: OI, Greeks (delta/gamma/vanna), IV — all in ticker.
+    Format: BTC-10APR26-80000-C
+    """
+    cfg = CRYPTO_CONFIG.get(currency, CRYPTO_CONFIG['BTC'])
+    strike_interval = cfg['strike_interval']
+    atm_strike      = round(spot_price / strike_interval) * strike_interval
+
+    # Build strike range
+    strikes_to_fetch = [
+        atm_strike + i * strike_interval
+        for i in range(-atm_range, atm_range + 1)
+    ]
+
+    rows     = []
+    progress = st.progress(0, text=f"Fetching {currency} options from Deribit...")
+
+    for idx, strike in enumerate(strikes_to_fetch):
+        progress.progress((idx + 1) / len(strikes_to_fetch),
+                          text=f"Strike ${strike:,.0f}...")
+
+        call_name = f"{currency}-{expiry}-{int(strike)}-C"
+        put_name  = f"{currency}-{expiry}-{int(strike)}-P"
+
+        call_t = deribit_get("ticker", {"instrument_name": call_name})
+        put_t  = deribit_get("ticker", {"instrument_name": put_name})
+        time.sleep(0.05)
+
+        if not call_t and not put_t:
+            continue
+
+        c_gr = call_t.get('greeks', {}) or {}
+        p_gr = put_t.get('greeks',  {}) or {}
+
+        # Deribit returns IV as decimal (0.85 = 85%)
+        c_iv_raw = float(call_t.get('mark_iv', 0) or 0)
+        p_iv_raw = float(put_t.get('mark_iv',  0) or 0)
+        call_iv  = c_iv_raw if c_iv_raw > 5 else c_iv_raw * 100
+        put_iv   = p_iv_raw if p_iv_raw > 5 else p_iv_raw * 100
+
+        call_delta = float(c_gr.get('delta', 0) or 0)
+        put_delta  = float(p_gr.get('delta', 0) or 0)
+        call_gamma = float(c_gr.get('gamma', 0) or 0)
+        put_gamma  = float(p_gr.get('gamma', 0) or 0)
+        call_vanna = float(c_gr.get('vanna', 0) or 0)
+        put_vanna  = float(p_gr.get('vanna', 0) or 0)
+        call_oi    = float(call_t.get('open_interest', 0) or 0)
+        put_oi     = float(put_t.get('open_interest',  0) or 0)
+        call_vol   = float(call_t.get('stats', {}).get('volume', 0) or 0)
+        put_vol    = float(put_t.get('stats',  {}).get('volume', 0) or 0)
+
+        div = cfg['unit_divisor']
+        rows.append({
+            'strike':         strike,
+            'call_oi':        call_oi,
+            'put_oi':         put_oi,
+            'call_volume':    call_vol,
+            'put_volume':     put_vol,
+            'call_iv':        call_iv,
+            'put_iv':         put_iv,
+            'call_delta':     call_delta,
+            'put_delta':      put_delta,
+            'call_gamma':     call_gamma,
+            'put_gamma':      put_gamma,
+            'call_vanna':     call_vanna,
+            'put_vanna':      put_vanna,
+            'net_gex':   (call_oi*call_gamma - put_oi*put_gamma)*spot_price**2/div,
+            'net_vanna': (call_oi*call_vanna  - put_oi*put_vanna)/div,
+            'net_dex':   (call_oi*call_delta  + put_oi*put_delta)/div,
+            'total_volume':   call_vol + put_vol,
+            'call_oi_change': 0.0,
+            'put_oi_change':  0.0,
+            'call_gex_flow':  0.0,
+            'put_gex_flow':   0.0,
+            'net_gex_flow':   0.0,
+            'spot_price':     spot_price,
+            'timestamp':      datetime.utcnow().replace(tzinfo=pytz.utc),
+        })
+
+    progress.empty()
+
+    if not rows:
+        st.error(f"No Deribit data for {currency} {expiry}. "
+                 "Check expiry format (e.g. 10APR26) or try a different expiry.")
+        return pd.DataFrame()
+
+    st.success(f"✅ Fetched {len(rows)} strikes from Deribit for {currency} {expiry}")
+
+    df = pd.DataFrame(rows)
+    df.attrs['unit_divisor'] = cfg['unit_divisor']
+    df = enrich_greeks_with_bs(df, spot_price, expiry)
+
+    # Interpolate to finer resolution
+    target = cfg.get('target_interval', cfg['strike_interval'])
+    if target < cfg['strike_interval']:
+        n_before = len(df)
+        df = interpolate_strikes(df, spot_price, target, expiry, cfg['unit_divisor'])
+        n_added = len(df) - n_before
+        if n_added > 0:
+            st.caption(f"✨ Added {n_added} synthetic strikes "
+                       f"(${cfg['strike_interval']} → ${target} resolution)")
+
+    df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
+    return df
+
+
+# ============================================================================
+# UNIFIED FETCH — routes to correct provider
+# ============================================================================
+
+def fetch_options_chain(currency: str, expiry: str,
+                         spot_price: float, atm_range: int,
+                         data_source: str = 'delta') -> pd.DataFrame:
+    """Route to Delta Exchange or Deribit based on user selection."""
+    if data_source == 'deribit':
+        return fetch_options_chain_deribit(currency, expiry, spot_price, atm_range)
+    else:
+        return fetch_options_chain_delta(currency, expiry, spot_price, atm_range)
+
+
+def get_expiries(currency: str, data_source: str = 'delta') -> list:
+    """Route expiry fetching to correct provider."""
+    if data_source == 'deribit':
+        return deribit_get_expiries(currency)
+    else:
+        return delta_get_expiries(currency)
+
+
+def get_spot(currency: str, data_source: str = 'delta') -> float:
+    """Route spot price to correct provider."""
+    if data_source == 'deribit':
+        return deribit_get_spot_price(currency)
+    else:
+        return delta_get_spot_price(currency)
+
+
+# ============================================================================
 # HISTORICAL DATA — Delta Exchange India (candles, realized vol, settlement)
 # ============================================================================
 
@@ -2524,13 +2717,14 @@ def show_landing() -> bool:
         '<div class="lp-hero">'
         '<div class="lp-badge-row">'
         '<span class="lp-badge"><span class="lp-badge-dot"></span>LIVE &#8212; Delta Exchange India</span>'
+        '<span class="lp-badge"><span class="lp-badge-dot"></span>&#127760; Deribit Global</span>'
         '<span class="lp-badge"><span class="lp-badge-dot"></span>&#x20BF; BTC &middot; &#x1F537; ETH &middot; &#x1F947; XAU Gold</span>'
         '<span class="lp-badge"><span class="lp-badge-dot"></span>24/7 Global Markets</span>'
         '</div>'
         '<div class="lp-headline">Crypto &amp; Gold<br>GEX / VANNA Analytics</div>'
         '<div class="lp-subline">'
         'Institutional-grade Gamma Exposure &middot; VANNA Cascade &middot; Dealer Flow analytics<br>'
-        'for BTC, ETH and XAU options &mdash; powered by Delta Exchange India &mdash; by NYZTrade Analytics'
+        'for BTC, ETH &amp; XAU options &mdash; Delta Exchange India &amp; Deribit &mdash; by NYZTrade Analytics'
         '</div>'
         '<div class="lp-social-row">'
         '<a class="lp-social-btn lp-social-yt" href="https://www.youtube.com/@nyztrade" target="_blank">&#9654; YouTube &#8212; @nyztrade</a>'
@@ -2646,7 +2840,7 @@ def main():
         '<div style="display:flex;justify-content:space-between;align-items:center;">'
         '<div>'
         '<h1 class="main-title">&#x20BF; NYZTrade Crypto GEX Dashboard</h1>'
-        '<p class="sub-title">BTC &middot; ETH &middot; XAU Gold | GEX / VANNA / Cascade | Delta Exchange India | 24/7 Live</p>'
+        '<p class="sub-title">BTC &middot; ETH &middot; XAU Gold | GEX / VANNA / Cascade | Delta Exchange India &amp; Deribit | 24/7 Live</p>'
         '</div>'
         '<div class="live-indicator"><div class="live-dot"></div>'
         '<span style="color:#ef4444;font-family:JetBrains Mono,monospace;font-size:0.8rem;">'
@@ -2659,26 +2853,52 @@ def main():
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
 
+        # ── Data Source selector ─────────────────────────────────────────
+        st.markdown("### 🔌 Data Source")
+        data_source = st.radio(
+            "Provider",
+            options=['delta', 'deribit'],
+            format_func=lambda x: DATA_SOURCES[x],
+            index=0,
+            horizontal=True,
+            help=(
+                "Delta Exchange India: Indian crypto exchange, INR-friendly\n"
+                "Deribit: Global crypto options leader, deeper BTC/ETH/XAU liquidity"
+            ),
+        )
+        # Show provider info
+        if data_source == 'delta':
+            st.caption("🇮🇳 api.india.delta.exchange — Free public API")
+        else:
+            st.caption("🌍 www.deribit.com — Free public API · Best BTC/ETH/XAU liquidity")
+
+        st.markdown("---")
+        st.markdown("### ⚙️ Configuration")
+
         currency = st.selectbox("🪙 Asset", ["BTC", "ETH", "XAU"],
                                  format_func=lambda x: {"BTC":"₿ Bitcoin","ETH":"🔷 Ethereum","XAU":"🥇 Gold (XAU)"}[x])
         cfg = CRYPTO_CONFIG[currency]
 
-        # Clear cached data when user switches asset
-        if st.session_state.get('last_currency') != currency:
+        # Clear cached data when user switches asset OR data source
+        cache_reset_key = f"{currency}_{data_source}"
+        if st.session_state.get('last_cache_key') != cache_reset_key:
             for key in ['crypto_df','crypto_meta','snapshot_history',
-                        'last_snapshot_time','hist_vol_df','settle_df']:
+                        'last_snapshot_time','hist_vol_df','settle_df',
+                        'expiries','spot_price']:
                 st.session_state.pop(key, None)
-            st.session_state['last_currency'] = currency
+            st.session_state['last_cache_key'] = cache_reset_key
+            st.session_state['last_currency']  = currency
 
-        target_iv = cfg.get('target_interval', cfg['strike_interval'])
+        target_iv    = cfg.get('target_interval', cfg['strike_interval'])
+        provider_lbl = "Delta India" if data_source == 'delta' else "Deribit Global"
         st.markdown(
             '<div class="crypto-badge">📊 {}</div>'.format(
-                f"Delta India | Contract: {cfg['contract_size']} {currency} | "
+                f"{provider_lbl} | Contract: {cfg['contract_size']} {currency} | "
                 f"Listed: ${cfg['strike_interval']:,} | Display: ${target_iv:,}"),
             unsafe_allow_html=True)
         if target_iv < cfg['strike_interval']:
             st.caption(
-                f"✨ {currency} listed at ${cfg['strike_interval']} intervals on Delta. "
+                f"✨ {currency} listed at ${cfg['strike_interval']} intervals on {provider_lbl}. "
                 f"Synthetic ${target_iv} strikes added via Black-Scholes interpolation."
             )
         if currency == 'XAU':
@@ -2700,8 +2920,8 @@ def main():
 
         if 'spot_price' not in st.session_state or \
            st.session_state.get('spot_currency') != currency:
-            with st.spinner(f"Fetching {currency} spot..."):
-                sp = delta_get_spot_price(currency)
+            with st.spinner(f"Fetching {currency} spot from {DATA_SOURCES[data_source]}..."):
+                sp = get_spot(currency, data_source)
                 st.session_state['spot_price']    = sp
                 st.session_state['spot_currency'] = currency
         spot_price = st.session_state['spot_price']
@@ -2747,8 +2967,8 @@ def main():
         else:
             if 'expiries' not in st.session_state or \
                st.session_state.get('expiry_currency') != currency:
-                with st.spinner("Loading expiries..."):
-                    expiries = delta_get_expiries(currency)
+                with st.spinner(f"Loading expiries from {DATA_SOURCES[data_source]}..."):
+                    expiries = get_expiries(currency, data_source)
                     st.session_state['expiries']        = expiries
                     st.session_state['expiry_currency'] = currency
             else:
@@ -2763,7 +2983,7 @@ def main():
                     if d.weekday() == 4:
                         fallback.append(d.strftime('%d%b%y').upper())
                 expiries = fallback
-                st.warning("Could not load expiries from Delta Exchange. Using next Fridays as fallback — click Load Expiries to retry.")
+                st.warning(f"Could not load expiries from {DATA_SOURCES[data_source]}. Using next Fridays as fallback — click Load Expiries to retry.")
 
         selected_expiry = st.selectbox("📆 Expiry", expiries)
 
@@ -2808,15 +3028,17 @@ def main():
         max_age   = 0 if fetch_btn else 60
         df, meta  = _load_cache(cache_key, max_age)
         if df is None:
-            with st.spinner(f"Fetching {currency} {selected_expiry} options chain from Delta Exchange India..."):
-                df = fetch_options_chain_delta(currency, selected_expiry,
-                                             spot_price, atm_range)
+            with st.spinner(f"Fetching {currency} {selected_expiry} from {DATA_SOURCES[data_source]}..."):
+                df = fetch_options_chain(currency, selected_expiry,
+                                        spot_price, atm_range, data_source)
             if df is not None and not df.empty:
                 meta = {
                     'symbol': currency, 'expiry': selected_expiry,
                     'spot_price': spot_price, 'fetch_time': datetime.utcnow().isoformat(),
                     'unit_label': cfg['unit_label'], 'contract_size': cfg['contract_size'],
                     'total_records': len(df),
+                    'data_source': data_source,
+                    'provider': DATA_SOURCES.get(data_source, data_source),
                 }
                 _save_cache(cache_key, df, meta)
                 # Auto-save to persistent history DB
@@ -2964,10 +3186,14 @@ def main():
             '<span class="crypto-badge">&#x20BF; {}</span>'
             '<span style="padding:6px 12px;background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);'
             'border-radius:8px;color:#10b981;font-family:JetBrains Mono,monospace;font-size:0.8rem;">&#9679; LIVE</span>'
+            '<span style="padding:6px 12px;background:rgba(139,92,246,0.15);border:1px solid rgba(139,92,246,0.3);'
+            'border-radius:8px;color:#a78bfa;font-family:JetBrains Mono,monospace;font-size:0.8rem;">'
+            '{}</span>'
             '<span style="color:#94a3b8;font-family:JetBrains Mono,monospace;font-size:0.85rem;">'
             '{} | Expiry: {} | Spot: ${} | Records: {}</span>'
             '</div>'.format(
                 currency,
+                DATA_SOURCES.get(data_source, data_source),
                 currency,
                 selected_expiry,
                 f"{spot_price:,.2f}",
