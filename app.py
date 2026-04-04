@@ -111,16 +111,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# DERIBIT CONFIGURATION
+# DELTA EXCHANGE INDIA CONFIGURATION
 # ============================================================================
-# Deribit API is FREE — no auth needed for market data
-# Get API keys from: https://www.deribit.com/account/mainaccount/api
-# For reading market data: no keys needed (public endpoints)
-# For trading: create Read-only API key on Deribit
+# Base URL: https://api.india.delta.exchange
+# Market data: PUBLIC — no auth needed (tickers, products, candles)
+# Trading API: requires API key (for future order features)
 #
-# In .streamlit/secrets.toml (optional — only for trading):
-#   DERIBIT_CLIENT_ID     = "your_client_id"
-#   DERIBIT_CLIENT_SECRET = "your_client_secret"
+# In .streamlit/secrets.toml:
+#   DELTA_API_KEY    = "your_api_key"
+#   DELTA_API_SECRET = "your_api_secret"
 # ============================================================================
 
 DELTA_BASE = "https://api.india.delta.exchange"
@@ -1010,7 +1009,7 @@ def enrich_greeks_with_bs(df: pd.DataFrame, spot_price: float,
                            expiry_str: str) -> pd.DataFrame:
     """
     Re-compute Greeks using Black-Scholes for any row where
-    gamma or vanna is 0/missing (Deribit sometimes omits these).
+    gamma or vanna is 0/missing (Delta Exchange sometimes omits these).
     Uses pure numpy arrays — completely avoids pandas index alignment issues.
     """
     if df.empty:
@@ -1239,20 +1238,15 @@ def get_polygon_gold_snapshot(spot_price: float, expiry_date: str,
 
 
 def get_spot_price(currency: str) -> float:
-    """Get current spot price for a currency."""
-    index_name = {
-        'BTC': 'btc_usd',
-        'ETH': 'eth_usd',
-        'XAU': 'xau_usd',  # Deribit uses xau_usd for gold index
-    }.get(currency, 'btc_usd')
-    result = deribit_get("get_index_price", {"index_name": index_name})
-    price = float(result.get('index_price', 0))
-    # Fallback defaults if API returns 0 (XAU may not have index on all plans)
-    _fallbacks = {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}
-    return price if price > 0 else _fallbacks.get(currency, 0)
+    """
+    Get current spot/mark price from Delta Exchange India.
+    Uses perpetual futures ticker as spot proxy.
+    Fallback to sensible defaults if API unavailable.
+    """
+    return delta_get_spot_price(currency)
 
 # ============================================================================
-# HISTORICAL DATA (Deribit free tier — settlement prices + last 5 days trades)
+# HISTORICAL DATA — Delta Exchange India (candles, realized vol, settlement)
 # ============================================================================
 
 def get_delta_historical_candles(currency: str, resolution: str = '1d',
@@ -2318,7 +2312,7 @@ def show_landing() -> bool:
         '<div class="lp-metrics">'
         '<div class="lp-metric"><div class="lp-metric-val">3</div><div class="lp-metric-lbl">Assets: BTC ETH XAU</div></div>'
         '<div class="lp-metric"><div class="lp-metric-val">6</div><div class="lp-metric-lbl">Analytics Tabs</div></div>'
-        '<div class="lp-metric"><div class="lp-metric-val">FREE</div><div class="lp-metric-lbl">Deribit API</div></div>'
+        '<div class="lp-metric"><div class="lp-metric-val">FREE</div><div class="lp-metric-lbl">Delta Exchange API</div></div>'
         '<div class="lp-metric"><div class="lp-metric-val">24/7</div><div class="lp-metric-lbl">Live Global Data</div></div>'
         '</div>'
     )
@@ -2446,7 +2440,7 @@ def main():
 
         st.markdown(
             '<div class="crypto-badge">📊 {}</div>'.format(
-                f"Deribit | Contract: {cfg['contract_size']} {currency} | Strike Δ: ${cfg['strike_interval']:,}"),
+                f"Delta India | Contract: {cfg['contract_size']} {currency} | Strike Δ: ${cfg['strike_interval']:,}"),
             unsafe_allow_html=True)
         if currency == 'XAU':
             api_key = get_polygon_api_key()
@@ -2530,7 +2524,7 @@ def main():
                     if d.weekday() == 4:
                         fallback.append(d.strftime('%d%b%y').upper())
                 expiries = fallback
-                st.warning("Could not load expiries from Deribit. Using next Fridays as fallback — click Load Expiries to retry.")
+                st.warning("Could not load expiries from Delta Exchange. Using next Fridays as fallback — click Load Expiries to retry.")
 
         selected_expiry = st.selectbox("📆 Expiry", expiries)
 
@@ -2575,7 +2569,7 @@ def main():
         max_age   = 0 if fetch_btn else 60
         df, meta  = _load_cache(cache_key, max_age)
         if df is None:
-            with st.spinner(f"Fetching {currency} {selected_expiry} options chain from Deribit..."):
+            with st.spinner(f"Fetching {currency} {selected_expiry} options chain from Delta Exchange India..."):
                 df = fetch_options_chain_delta(currency, selected_expiry,
                                              spot_price, atm_range)
             if df is not None and not df.empty:
@@ -3097,14 +3091,14 @@ def main():
         with tabs[10]:
             st.markdown(f"### 📉 {currency} Historical Volatility")
             st.markdown("""<div class="spike-legend">
-            <b>Realized Volatility</b> = actual price volatility over past 30 days (free from Deribit)<br>
+            <b>Realized Volatility</b> = actual price volatility over past 30 days (Delta Exchange candles)<br>
             Use this to contextualize current IV levels from the IV Smile tab<br>
             <b>IV > Realized Vol</b> = options expensive, dealers collecting premium (range-bound expected)<br>
             <b>IV < Realized Vol</b> = options cheap, market underpricing risk (breakout expected)
             </div>""", unsafe_allow_html=True)
 
             if st.button("📥 Load Historical Volatility", use_container_width=True, key="load_hist_vol"):
-                with st.spinner(f"Fetching {currency} 30-day realized vol from Deribit..."):
+                with st.spinner(f"Fetching {currency} 30-day realized vol from Delta Exchange India..."):
                     vol_df = get_delta_historical_iv(currency, selected_expiry)
                     st.session_state['hist_vol_df'] = vol_df
 
@@ -3323,7 +3317,7 @@ def main():
     <div style="text-align:center;padding:16px;color:#64748b;">
         <p style="font-family:'JetBrains Mono',monospace;font-size:0.82rem;">
             NYZTrade Crypto GEX &nbsp;|&nbsp; BTC &middot; ETH &middot; XAU &nbsp;|&nbsp;
-            Powered by Deribit API &nbsp;|&nbsp; GEX / VANNA / Cascade Analytics<br>
+            Powered by Delta Exchange India &nbsp;|&nbsp; GEX / VANNA / Cascade Analytics<br>
             &#9888;&#65039; For educational and research purposes only. Not financial advice.
         </p>
     </div>
