@@ -245,13 +245,19 @@ def delta_get_ticker(symbol: str) -> dict:
 
 def delta_get_all_tickers(contract_type: str = 'options') -> list:
     """
-    Fetch tickers for all options in one call — much faster than per-strike.
+    Fetch tickers for all options in one call.
     Endpoint: GET /v2/tickers?contract_types=call_options,put_options
+    Delta Exchange returns a list under 'result'.
     """
     resp = delta_get("/v2/tickers", {
         "contract_types": "call_options,put_options",
     })
-    return resp.get('result', [])
+    result = resp.get('result', [])
+    # Handle both list and dict response formats
+    if isinstance(result, dict):
+        # Some versions wrap in a dict
+        result = list(result.values()) if result else []
+    return result if isinstance(result, list) else []
 
 
 def delta_get_expiries(currency: str) -> list:
@@ -476,104 +482,234 @@ def fetch_options_chain_delta(currency: str, expiry: str,
     return df
 
 
+def _extract_delta_fields(t: dict) -> dict:
+    """
+    Robustly extract fields from a Delta Exchange ticker response.
+    Handles multiple possible field name variants across API versions.
+    Returns normalised dict with standard field names.
+    """
+    def _f(val): 
+        try: return float(val or 0)
+        except: return 0.0
+
+    # ── Greeks: may be nested under 'greeks' or flat ─────────────────────
+    gr = t.get('greeks') or {}
+    if not isinstance(gr, dict):
+        gr = {}
+
+    delta = _f(gr.get('delta') or t.get('delta'))
+    gamma = _f(gr.get('gamma') or t.get('gamma'))
+    vanna = _f(gr.get('vanna') or t.get('vanna'))
+
+    # ── IV: Delta Exchange uses mark_iv (annualised %) ────────────────────
+    # mark_iv is returned as a decimal (0.85 = 85%) or as percent (85.0)
+    raw_iv = _f(
+        t.get('mark_iv') or t.get('implied_volatility') or
+        t.get('iv') or t.get('mark_volatility') or 0
+    )
+    # Normalise: if > 5 assume it's already in percent, else convert
+    iv_pct = raw_iv if raw_iv > 5 else raw_iv * 100
+
+    # ── OI: multiple possible field names ─────────────────────────────────
+    oi = _f(
+        t.get('open_interest') or t.get('oi') or
+        t.get('open_interest_usd') or 0
+    )
+
+    # ── Volume: 24h volume in contracts ──────────────────────────────────
+    vol = _f(
+        t.get('volume') or t.get('volume_24h') or
+        t.get('turnover') or t.get('turnover_24h') or
+        t.get('contract_volume') or 0
+    )
+
+    return {
+        'delta': delta,
+        'gamma': gamma,
+        'vanna': vanna,
+        'iv_pct': iv_pct,
+        'oi':     oi,
+        'volume': vol,
+    }
+
+
 def _fetch_via_bulk_tickers(currency: str, expiry: str, spot_price: float,
                               atm_range: int, cfg: dict) -> pd.DataFrame:
     """
-    Fallback: parse all tickers and match by symbol naming convention.
-    Delta Exchange symbol format: C-BTC-{strike}-{DDMMMYY}
-    e.g. C-BTC-70000-250425 or BTC-25APR25-70000-C
+    Fetch options chain from Delta Exchange bulk tickers endpoint.
+    Handles all Delta Exchange symbol naming variants robustly.
+    Delta symbol formats observed:
+      C-ETH-2000-100425   (call-underlying-strike-DDMMYY)
+      P-BTC-70000-100425  (put-underlying-strike-DDMMYY)
     """
     all_tickers = delta_get_all_tickers()
     if not all_tickers:
+        st.error("Delta Exchange bulk tickers returned no data. Check API connectivity.")
         return pd.DataFrame()
 
-    # Try to parse expiry date for matching
+    # ── Parse expiry into multiple match variants ─────────────────────────
     try:
         exp_dt = datetime.strptime(expiry, '%d%b%y')
-        exp_str_variants = [
-            exp_dt.strftime('%d%m%y'),   # 250425
-            exp_dt.strftime('%d%b%y').upper(),  # 25APR25
-            exp_dt.strftime('%Y%m%d'),   # 20250425
+        # Delta uses DDMMYY format: 10APR26 → 100426
+        exp_variants = [
+            exp_dt.strftime('%d%m%y'),        # 100426  ← primary Delta format
+            exp_dt.strftime('%d%m%Y'),        # 10042026
+            exp_dt.strftime('%Y%m%d'),        # 20260410
+            exp_dt.strftime('%d%b%y').upper(),# 10APR26
+            exp_dt.strftime('%d%b%Y').upper(),# 10APR2026
+            expiry.upper(),                   # raw input
         ]
     except Exception:
-        exp_str_variants = [expiry]
+        exp_variants = [expiry.upper()]
+
+    # ── Debug: show sample tickers to understand structure ────────────────
+    sample_syms = [t.get('symbol','') for t in all_tickers[:20]]
+    eth_syms = [s for s in sample_syms if currency.upper() in s.upper()]
+    if eth_syms:
+        st.info(f"Sample {currency} symbols from Delta: {eth_syms[:5]}")
 
     calls = {}
     puts  = {}
+
     for t in all_tickers:
-        sym = t.get('symbol', '').upper()
-        # Check if this ticker matches our currency
+        sym = (t.get('symbol') or '').upper()
+        if not sym:
+            continue
+
+        # Must contain the currency
         if currency.upper() not in sym:
             continue
-        # Check expiry
-        matched_exp = any(ev in sym for ev in exp_str_variants)
-        if not matched_exp:
+
+        # Must match one of our expiry variants
+        if not any(ev in sym for ev in exp_variants):
             continue
-        # Parse strike
+
+        # ── Parse strike from symbol ──────────────────────────────────────
+        # Format: C-ETH-2000-100426 → parts = ['C','ETH','2000','100426']
+        parts = sym.split('-')
         strike = None
-        for part in sym.split('-'):
+        for part in parts:
             try:
                 v = float(part)
-                if v > 100:  # strikes are always > 100
+                # Strike must be > 100 and look like a round option strike
+                if v > 100 and v == int(v):
                     strike = v
                     break
             except Exception:
                 continue
+
         if strike is None:
             continue
-        # Classify call/put
-        if sym.startswith('C-') or sym.endswith('-C') or 'CALL' in sym:
+
+        # ── Classify call/put ─────────────────────────────────────────────
+        is_call = (
+            parts[0] == 'C' or
+            parts[-1] == 'C' or
+            sym.endswith('-C') or
+            'CALL' in sym
+        )
+        is_put = (
+            parts[0] == 'P' or
+            parts[-1] == 'P' or
+            sym.endswith('-P') or
+            'PUT' in sym
+        )
+
+        if is_call:
             calls[strike] = t
-        elif sym.startswith('P-') or sym.endswith('-P') or 'PUT' in sym:
+        elif is_put:
             puts[strike] = t
 
-    if not calls and not puts:
+    all_strikes = sorted(set(list(calls.keys()) + list(puts.keys())))
+
+    if not all_strikes:
+        # Last resort: show all matching symbols to help debug
+        matching = [t.get('symbol','') for t in all_tickers
+                    if currency.upper() in (t.get('symbol','') or '').upper()]
+        st.error(
+            f"Could not parse any {currency} {expiry} option strikes from Delta Exchange.\n"
+            f"Found {len(matching)} {currency} symbols total. Sample: {matching[:8]}"
+        )
         return pd.DataFrame()
 
+    # ── Build options chain ───────────────────────────────────────────────
+    atm = round(spot_price / cfg['strike_interval']) * cfg['strike_interval']
+    div = cfg['unit_divisor']
     rows = []
-    atm  = round(spot_price / cfg['strike_interval']) * cfg['strike_interval']
-    div  = cfg['unit_divisor']
 
-    for strike in sorted(set(list(calls.keys()) + list(puts.keys()))):
-        if abs(strike - atm) > atm_range * cfg['strike_interval']:
-            continue
+    # Filter to ATM range but include all if too few
+    range_strikes = [s for s in all_strikes
+                     if abs(s - atm) <= atm_range * cfg['strike_interval']]
+    if len(range_strikes) < 3:
+        range_strikes = all_strikes  # use all if range is too narrow
+
+    for strike in range_strikes:
         ct = calls.get(strike, {})
         pt = puts.get(strike, {})
-        c_gr = ct.get('greeks', {}) or {}
-        p_gr = pt.get('greeks', {}) or {}
-        call_oi    = float(ct.get('open_interest', 0) or 0)
-        put_oi     = float(pt.get('open_interest', 0) or 0)
-        call_gamma = float(c_gr.get('gamma', 0) or 0)
-        put_gamma  = float(p_gr.get('gamma', 0) or 0)
-        call_vanna = float(c_gr.get('vanna', 0) or 0)
-        put_vanna  = float(p_gr.get('vanna', 0) or 0)
-        call_delta = float(c_gr.get('delta', 0) or 0)
-        put_delta  = float(p_gr.get('delta', 0) or 0)
+
+        cf = _extract_delta_fields(ct)
+        pf = _extract_delta_fields(pt)
+
+        call_oi    = cf['oi']
+        put_oi     = pf['oi']
+        call_gamma = cf['gamma']
+        put_gamma  = pf['gamma']
+        call_vanna = cf['vanna']
+        put_vanna  = pf['vanna']
+        call_delta = cf['delta']
+        put_delta  = pf['delta']
+        call_iv    = cf['iv_pct']
+        put_iv     = pf['iv_pct']
+        call_vol   = cf['volume']
+        put_vol    = pf['volume']
+
         rows.append({
-            'strike':       strike,
-            'call_oi':      call_oi,
-            'put_oi':       put_oi,
-            'call_volume':  float(ct.get('volume', 0) or 0),
-            'put_volume':   float(pt.get('volume', 0) or 0),
-            'call_iv':      float(ct.get('mark_iv', 0) or 0),
-            'put_iv':       float(pt.get('mark_iv', 0) or 0),
-            'call_delta':   call_delta,  'put_delta':  put_delta,
-            'call_gamma':   call_gamma,  'put_gamma':  put_gamma,
-            'call_vanna':   call_vanna,  'put_vanna':  put_vanna,
-            'net_gex':      (call_oi*call_gamma - put_oi*put_gamma)*spot_price**2/div,
-            'net_vanna':    (call_oi*call_vanna - put_oi*put_vanna)/div,
-            'net_dex':      (call_oi*call_delta + put_oi*put_delta)/div,
-            'total_volume': float(ct.get('volume',0) or 0) + float(pt.get('volume',0) or 0),
-            'call_oi_change': 0.0, 'put_oi_change': 0.0,
-            'call_gex_flow':  0.0, 'put_gex_flow':  0.0, 'net_gex_flow': 0.0,
-            'spot_price':   spot_price,
-            'timestamp':    datetime.utcnow().replace(tzinfo=pytz.utc),
+            'strike':         strike,
+            'call_oi':        call_oi,
+            'put_oi':         put_oi,
+            'call_volume':    call_vol,
+            'put_volume':     put_vol,
+            'call_iv':        call_iv,
+            'put_iv':         put_iv,
+            'call_delta':     call_delta,
+            'put_delta':      put_delta,
+            'call_gamma':     call_gamma,
+            'put_gamma':      put_gamma,
+            'call_vanna':     call_vanna,
+            'put_vanna':      put_vanna,
+            'net_gex':   (call_oi*call_gamma - put_oi*put_gamma)*spot_price**2/div,
+            'net_vanna': (call_oi*call_vanna  - put_oi*put_vanna)/div,
+            'net_dex':   (call_oi*call_delta  + put_oi*put_delta)/div,
+            'total_volume':   call_vol + put_vol,
+            'call_oi_change': 0.0,
+            'put_oi_change':  0.0,
+            'call_gex_flow':  0.0,
+            'put_gex_flow':   0.0,
+            'net_gex_flow':   0.0,
+            'spot_price':     spot_price,
+            'timestamp':      datetime.utcnow().replace(tzinfo=pytz.utc),
         })
 
     if not rows:
+        st.error(f"No rows built for {currency} {expiry}.")
         return pd.DataFrame()
+
+    st.success(f"Fetched {len(rows)} strikes for {currency} {expiry}")
+
+    # Debug: show raw OI and IV to verify data quality
+    total_oi  = sum(r['call_oi'] + r['put_oi'] for r in rows)
+    total_vol = sum(r['total_volume'] for r in rows)
+    if total_oi == 0:
+        st.warning(
+            "All OI values are 0. Delta Exchange may not be returning OI in this endpoint. "
+            "Greeks will be computed via Black-Scholes from IV. "
+            "GEX chart will still work based on theoretical positioning."
+        )
+
     df = pd.DataFrame(rows)
     df.attrs['unit_divisor'] = cfg['unit_divisor']
+
+    # Always enrich Greeks with BS (fills zeros from API + computes vanna)
     df = enrich_greeks_with_bs(df, spot_price, expiry)
     df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
     return df
