@@ -128,7 +128,8 @@ DELTA_BASE = "https://api.india.delta.exchange"
 CRYPTO_CONFIG = {
     'BTC': {
         'contract_size':   1,
-        'strike_interval': 1000,   # Delta Exchange India: BTC weekly at $1000 intervals
+        'strike_interval': 1000,   # Delta Exchange India lists at $1000 intervals
+        'target_interval':  500,    # We interpolate to $500 via BS
         # Calibration: dominant GEX ~300,000K → $500 forced move
         # 500/300000 = 0.00167. Use 0.002 (gives 600pts → capped at 1500)
         'pts_per_unit':    0.002,
@@ -142,7 +143,8 @@ CRYPTO_CONFIG = {
     },
     'ETH': {
         'contract_size':   1,
-        'strike_interval': 50,    # Delta Exchange India: ETH at $50 intervals (confirmed)
+        'strike_interval': 50,    # Delta Exchange India lists at $50 intervals
+        'target_interval':  25,    # We interpolate to $25 via BS — finer resolution
         # Calibration: dominant GEX ~2863K → $72 forced move
         # 75/2863 = 0.026. Use 0.025
         'pts_per_unit':    0.025,
@@ -433,6 +435,151 @@ def create_historical_heatmap(hist_df: pd.DataFrame, metric: str = 'net_gex',
     return fig
 
 # ============================================================================
+# STRIKE INTERPOLATION — Fine resolution from coarse exchange listings
+# Generates synthetic $25 strikes between real $50 Delta Exchange strikes
+# using IV smile interpolation + exact Black-Scholes Greeks
+# ============================================================================
+
+def interpolate_strikes(df: pd.DataFrame, spot_price: float,
+                        target_interval: float, expiry_str: str,
+                        unit_divisor: float = 1e3) -> pd.DataFrame:
+    """
+    Interpolate synthetic strikes between real exchange-listed strikes.
+
+    When Delta Exchange lists at $50 intervals but you want $25 resolution:
+    - Real strikes:      1900, 1950, 2000, 2050
+    - Synthetic added:   1925, 1975, 2025
+    - OI interpolated:   linear between neighbours
+    - IV interpolated:   linear (respects IV smile shape)
+    - Greeks computed:   exact Black-Scholes at synthetic strike using interp IV
+
+    This gives 2× finer GEX/VANNA resolution without extra API calls.
+    Same technique used by SpotGamma for US equity options.
+    """
+    if df.empty:
+        return df
+
+    df = df.sort_values('strike').reset_index(drop=True)
+    actual_strikes = df['strike'].tolist()
+
+    if len(actual_strikes) < 2:
+        return df
+
+    # Detect actual exchange interval
+    gaps = [actual_strikes[i+1] - actual_strikes[i]
+            for i in range(len(actual_strikes)-1)]
+    common_gap = max(set(gaps), key=gaps.count)
+
+    # Only interpolate if target is finer than actual
+    if target_interval >= common_gap:
+        return df
+
+    # Parse TTE
+    try:
+        exp_dt = datetime.strptime(expiry_str, '%d%b%y')
+        tte    = max((exp_dt - datetime.utcnow()).days / 365.0, 1/365)
+    except Exception:
+        tte = 7 / 365.0
+
+    new_rows = []
+    S = float(spot_price)
+    r = 0.05
+
+    for i in range(len(actual_strikes) - 1):
+        K_lo = actual_strikes[i]
+        K_hi = actual_strikes[i + 1]
+        gap  = K_hi - K_lo
+
+        if gap <= target_interval:
+            continue  # already at target resolution
+
+        row_lo = df[df['strike'] == K_lo].iloc[0]
+        row_hi = df[df['strike'] == K_hi].iloc[0]
+
+        # Generate synthetic strikes in the gap
+        n_synth = int(gap / target_interval) - 1
+        for j in range(1, n_synth + 1):
+            K_s  = K_lo + j * target_interval
+            w    = j / (n_synth + 1)   # weight: 0→1 from lo to hi
+
+            # ── Interpolate OI (linear) ─────────────────────────────────
+            call_oi_s = row_lo['call_oi'] * (1-w) + row_hi['call_oi'] * w
+            put_oi_s  = row_lo['put_oi']  * (1-w) + row_hi['put_oi']  * w
+
+            # ── Interpolate IV (linear along smile) ─────────────────────
+            call_iv_lo = max(row_lo['call_iv'], 1.0)
+            call_iv_hi = max(row_hi['call_iv'], 1.0)
+            put_iv_lo  = max(row_lo['put_iv'],  1.0)
+            put_iv_hi  = max(row_hi['put_iv'],  1.0)
+            call_iv_s  = call_iv_lo * (1-w) + call_iv_hi * w
+            put_iv_s   = put_iv_lo  * (1-w) + put_iv_hi  * w
+
+            # ── Exact BS Greeks at synthetic strike ──────────────────────
+            c_iv_frac = call_iv_s / 100.0
+            p_iv_frac = put_iv_s  / 100.0
+            sqrtT     = np.sqrt(tte)
+
+            def _d1(iv): return (np.log(S / K_s) + (r + 0.5*iv**2)*tte) / max(iv*sqrtT, 1e-10)
+            def _gamma(iv): return norm.pdf(_d1(iv)) / max(S * iv * sqrtT, 1e-10)
+            def _vanna(iv):
+                d1 = _d1(iv); d2 = d1 - iv*sqrtT
+                return -norm.pdf(d1) * d2 / max(iv, 1e-10)
+            def _delta_c(iv): return norm.cdf(_d1(iv))
+            def _delta_p(iv): return norm.cdf(_d1(iv)) - 1.0
+
+            c_gamma = _gamma(c_iv_frac);    p_gamma = _gamma(p_iv_frac)
+            c_vanna = _vanna(c_iv_frac);    p_vanna = _vanna(p_iv_frac)
+            c_delta = _delta_c(c_iv_frac);  p_delta = _delta_p(p_iv_frac)
+
+            # ── GEX / VANNA / DEX ────────────────────────────────────────
+            net_gex_s   = (call_oi_s*c_gamma - put_oi_s*p_gamma) * S**2 / unit_divisor
+            net_vanna_s = (call_oi_s*c_vanna - put_oi_s*p_vanna)        / unit_divisor
+            net_dex_s   = (call_oi_s*c_delta + put_oi_s*p_delta)        / unit_divisor
+
+            new_rows.append({
+                'strike':         K_s,
+                'call_oi':        call_oi_s,
+                'put_oi':         put_oi_s,
+                'call_volume':    (row_lo['call_volume'] + row_hi['call_volume']) / 2,
+                'put_volume':     (row_lo['put_volume']  + row_hi['put_volume'])  / 2,
+                'call_iv':        call_iv_s,
+                'put_iv':         put_iv_s,
+                'call_delta':     c_delta,
+                'put_delta':      p_delta,
+                'call_gamma':     c_gamma,
+                'put_gamma':      p_gamma,
+                'call_vanna':     c_vanna,
+                'put_vanna':      p_vanna,
+                'net_gex':        net_gex_s,
+                'net_vanna':      net_vanna_s,
+                'net_dex':        net_dex_s,
+                'total_volume':   0.0,
+                'call_oi_change': 0.0,
+                'put_oi_change':  0.0,
+                'call_gex_flow':  0.0,
+                'put_gex_flow':   0.0,
+                'net_gex_flow':   0.0,
+                'enhanced_oi_gex': 0.0,
+                'spot_price':     spot_price,
+                'timestamp':      df['timestamp'].iloc[0] if 'timestamp' in df.columns
+                                  else datetime.utcnow().replace(tzinfo=pytz.utc),
+                '_synthetic':     True,   # flag for display
+            })
+
+    if not new_rows:
+        return df
+
+    # Merge synthetic + real strikes, sort
+    synth_df = pd.DataFrame(new_rows)
+    if '_synthetic' not in df.columns:
+        df['_synthetic'] = False
+    combined = pd.concat([df, synth_df], ignore_index=True)
+    combined = combined.sort_values('strike').reset_index(drop=True)
+    combined.attrs.update(df.attrs)
+    return combined
+
+
+# ============================================================================
 # DELTA EXCHANGE INDIA — API LAYER
 # Base URL: https://api.india.delta.exchange
 # Market data (tickers, products, candles): PUBLIC — no auth needed
@@ -717,6 +864,17 @@ def fetch_options_chain_delta(currency: str, expiry: str,
     df.attrs['unit_divisor'] = cfg['unit_divisor']
     # Enrich zero Greeks with Black-Scholes
     df = enrich_greeks_with_bs(df, spot_price, expiry)
+
+    # Interpolate to finer strike resolution
+    target = cfg.get('target_interval', cfg['strike_interval'])
+    if target < cfg['strike_interval']:
+        n_before = len(df)
+        df = interpolate_strikes(df, spot_price, target, expiry, cfg['unit_divisor'])
+        n_added = len(df) - n_before
+        if n_added > 0:
+            st.caption(f"✨ Added {n_added} synthetic strikes via BS interpolation "
+                       f"(${cfg['strike_interval']} → ${target} resolution)")
+
     df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
     return df
 
@@ -950,6 +1108,17 @@ def _fetch_via_bulk_tickers(currency: str, expiry: str, spot_price: float,
 
     # Always enrich Greeks with BS (fills zeros from API + computes vanna)
     df = enrich_greeks_with_bs(df, spot_price, expiry)
+
+    # Interpolate to finer strike resolution if target_interval < strike_interval
+    target = cfg.get('target_interval', cfg['strike_interval'])
+    if target < cfg['strike_interval']:
+        n_before = len(df)
+        df = interpolate_strikes(df, spot_price, target, expiry, cfg['unit_divisor'])
+        n_added = len(df) - n_before
+        if n_added > 0:
+            st.caption(f"✨ Added {n_added} synthetic strikes via BS interpolation "
+                       f"(${cfg['strike_interval']} → ${target} resolution)")
+
     df = _compute_enhanced_oi_gex_crypto(df, spot_price, cfg['unit_label'])
     return df
 
@@ -2444,10 +2613,17 @@ def main():
                 st.session_state.pop(key, None)
             st.session_state['last_currency'] = currency
 
+        target_iv = cfg.get('target_interval', cfg['strike_interval'])
         st.markdown(
             '<div class="crypto-badge">📊 {}</div>'.format(
-                f"Delta India | Contract: {cfg['contract_size']} {currency} | Strike Δ: ${cfg['strike_interval']:,}"),
+                f"Delta India | Contract: {cfg['contract_size']} {currency} | "
+                f"Listed: ${cfg['strike_interval']:,} | Display: ${target_iv:,}"),
             unsafe_allow_html=True)
+        if target_iv < cfg['strike_interval']:
+            st.caption(
+                f"✨ {currency} listed at ${cfg['strike_interval']} intervals on Delta. "
+                f"Synthetic ${target_iv} strikes added via Black-Scholes interpolation."
+            )
         if currency == 'XAU':
             api_key = get_polygon_api_key()
             if api_key:
