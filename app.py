@@ -2749,15 +2749,10 @@ def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
             f'IV: <span style="color:{iv_color}">{iv_regime}</span> | '
             f'Skew: {iv_skew:+.1f}% | Max: {max_enh_v:.4f}{unit_label}</sup>'
         ),
-        xaxis=dict(
-            title=f'Enhanced OI VANNA ({unit_label})',
-            zeroline=True, zerolinecolor='rgba(255,255,255,0.25)', zerolinewidth=2,
-            gridcolor='rgba(128,128,128,0.2)',
-        ),
-        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
         xaxis=dict(title=f'Enhanced OI VANNA ({unit_label}) / Volume (scaled)',
                    zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
                    gridcolor='rgba(128,128,128,0.15)'),
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
         barmode='overlay', bargap=0.10,
         height=720, template='plotly_dark',
         plot_bgcolor='rgba(15,23,42,0.9)', paper_bgcolor='rgba(0,0,0,0)',
