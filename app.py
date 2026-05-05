@@ -167,19 +167,19 @@ CRYPTO_CONFIG = {
         'color':           '#6366f1',
     },
     'XAU': {
-        'contract_size':   1,
+        'contract_size':   100,        # COMEX GC: 100 troy oz per contract
         'strike_interval': 25,
-        # Gold spot ~$3100, $25 intervals, typical GEX ~500K
-        # 500K × 0.010 = $5 per strike → cap $25 for gold
-        'pts_per_unit':    0.010,
-        'strike_cap_pts':  25,    # Gold moves $10-25 per major level
+        # Calibrated: OI~5000-10000 ATM, ATM gamma~0.0023, S~3300
+        # raw_gex = 8000 * 0.0023 * 3300^2 = ~200M → div=1e8 → ~2.0 display units
+        'pts_per_unit':    0.0003,     # calibrated: 1 display GEX unit ≈ $0.30 move
+        'strike_cap_pts':  35,         # COMEX opex: $15-40 intraday move at gamma unwind
         'currency':        'XAU',
         'delta_symbol':    'XAUUSD',
-        'unit_label':      'K',
-        'unit_divisor':    1e3,
+        'unit_label':      'M',        # millions — GEX in $M for Gold
+        'unit_divisor':    1e8,        # calibrated to COMEX OI scale
         'emoji':           '🥇',
         'color':           '#fbbf24',
-        'data_source':     'POLYGON',  # fallback if Delta doesn't have XAU options
+        'data_source':     'massive',  # Massive.com Forex API for live XAU/USD
     },
 }
 
@@ -1546,14 +1546,27 @@ def fetch_options_chain_xau_massive(expiry_str: str,
     c_delta = norm.cdf(c_d1)
     p_delta = norm.cdf(p_d1) - 1.0
 
-    # Synthetic OI — log-normal centred on ATM, put-heavy (typical Gold structure)
-    dist       = np.abs(K - S)
-    sigma_oi   = S * 0.04                          # OI spread ~4% of spot
-    call_oi    = np.round(8000 * np.exp(-0.5 * (dist / sigma_oi)**2)).astype(int)
-    put_oi     = np.round(10000 * np.exp(-0.5 * (dist / (sigma_oi * 1.15))**2)).astype(int)
-    # More puts OTM below spot (hedging demand)
-    below      = K < S
-    put_oi     = np.where(below, (put_oi * 1.3).astype(int), put_oi)
+    # Synthetic OI — asymmetric structure matching real Gold market:
+    # Calls concentrated ABOVE spot (upside speculation + call writers)
+    # Puts concentrated BELOW spot (hedging demand, classic put skew)
+    # This creates correct S-shaped net_gex: positive above, negative below
+    dist     = np.abs(K - S)
+    sigma_oi = S * 0.045                       # OI spread ~4.5% of spot
+    oi_base  = np.exp(-0.5 * (dist / sigma_oi)**2)
+
+    # Call OI: strong above spot (upside bets + call overwriting)
+    call_oi = np.where(K >= S,
+                       np.round(8000 * oi_base).astype(int),   # above: full OI
+                       np.round(2500 * oi_base).astype(int))   # below: light
+
+    # Put OI: strong below spot (hedging demand, put buying for protection)
+    put_oi  = np.where(K <= S,
+                       np.round(10000 * oi_base).astype(int),  # below: heavy hedging
+                       np.round(2000  * oi_base).astype(int))  # above: light
+
+    # Extra put weight far OTM below (tail-risk hedging in Gold)
+    far_otm  = K < (S * 0.97)
+    put_oi   = np.where(far_otm, (put_oi * 1.4).astype(int), put_oi)
 
     # Volume — correlated to OI with noise
     rng        = np.random.default_rng(int(S) % 999)
@@ -1576,9 +1589,10 @@ def fetch_options_chain_xau_massive(expiry_str: str,
         'put_vanna':   p_vanna,
     })
 
-    # Compute GEX / VANNA / DEX
-    df['net_gex']   = (df['call_oi'] * df['call_gamma']
-                       - df['put_oi'] * df['put_gamma']) * S**2 / unit_div
+    # Compute GEX / VANNA / DEX — keep call/put sides separate for overlay chart
+    df['call_gex']  = df['call_oi'] * df['call_gamma'] * S**2 / unit_div
+    df['put_gex']   = df['put_oi']  * df['put_gamma']  * S**2 / unit_div
+    df['net_gex']   = df['call_gex'] - df['put_gex']
     df['net_vanna'] = (df['call_oi'] * df['call_vanna']
                        - df['put_oi'] * df['put_vanna']) / unit_div
     df['net_dex']   = (df['call_oi'] * df['call_delta']
@@ -2123,7 +2137,8 @@ CASCADE_TOTAL_POTENTIAL = {
     # XAU: $20-80 move typical on monthly expiry GEX unwind
     'BTC': 2500,
     'ETH': 350,
-    'XAU': 60,
+    'XAU': 35,   # COMEX Gold monthly opex: empirical $15-40 forced move range
+                  # Bear side (put wall unwind) ~$17.5 | Bull side (call wall) ~$17.5
 }
 
 
@@ -2615,54 +2630,80 @@ def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float
     max_enh = df_s['enhanced_oi_gex'].abs().max() or 1
     flip_zones = identify_gamma_flip_zones(df_s, spot_price)
 
+    # ── Compute call_gex / put_gex if not already present ───────────────────
+    if 'call_gex' not in df_s.columns or df_s['call_gex'].abs().sum() == 0:
+        if 'call_oi' in df_s.columns and 'call_gamma' in df_s.columns:
+            _raw_c = df_s['call_oi'].fillna(0) * df_s['call_gamma'].fillna(0) * spot_price**2
+            _raw_p = df_s['put_oi'].fillna(0)  * df_s['put_gamma'].fillna(0)  * spot_price**2
+            _ref   = max(df_s['net_gex'].abs().max(), 1e-10)
+            _div   = (_raw_c + _raw_p).abs().mean() / _ref if (_raw_c + _raw_p).abs().mean() > 0 else 1
+            df_s['call_gex'] = _raw_c / _div
+            df_s['put_gex']  = _raw_p / _div
+        else:
+            df_s['call_gex'] = df_s['net_gex'].clip(lower=0)
+            df_s['put_gex']  = df_s['net_gex'].clip(upper=0).abs()
+    df_s['call_gex'] = df_s['call_gex'].fillna(0)
+    df_s['put_gex']  = df_s['put_gex'].fillna(0)
+    max_call = df_s['call_gex'].abs().max() or 1
+    max_put  = df_s['put_gex'].abs().max() or 1
+
     fig = go.Figure()
 
-    # Original GEX — green/red semi-transparent
-    orig_colors = ['rgba(16,185,129,0.55)' if x >= 0 else 'rgba(239,68,68,0.55)'
-                   for x in df_s['net_gex']]
+    # ── Layer 1: Call GEX — green, long gamma (absorbs upside rally) ─────────
     fig.add_trace(go.Bar(
-        y=df_s['strike'], x=df_s['net_gex'], orientation='h',
-        marker=dict(color=orig_colors, line=dict(width=0)),
-        name=f'Standard GEX — Max: {max_gex:.4f}{unit_label}',
-        hovertemplate='Strike: %{y:,.0f}<br>GEX: %{x:.4f}' + unit_label + '<extra></extra>',
+        y=df_s['strike'], x=df_s['call_gex'], orientation='h',
+        marker=dict(color='rgba(16,185,129,0.75)', line=dict(color='#10b981', width=0.5)),
+        name=f'Call GEX (Long γ) — Peak: {max_call:.3f}{unit_label}',
+        hovertemplate='Strike: %{y:,.0f}<br>Call GEX: +%{x:.4f}' + unit_label + '<extra></extra>',
     ))
 
-    # Enhanced OI GEX — purple/gold opaque overlay
-    enh_colors = ['rgba(139,92,246,0.88)' if x >= 0 else 'rgba(245,158,11,0.88)'
+    # ── Layer 2: Put GEX — red on negative side (short gamma, amplifies drop) ─
+    fig.add_trace(go.Bar(
+        y=df_s['strike'], x=-df_s['put_gex'], orientation='h',
+        marker=dict(color='rgba(239,68,68,0.75)', line=dict(color='#ef4444', width=0.5)),
+        name=f'Put GEX (Short γ) — Peak: {max_put:.3f}{unit_label}',
+        hovertemplate='Strike: %{y:,.0f}<br>Put GEX: −%{customdata:.4f}' + unit_label + '<extra></extra>',
+        customdata=df_s['put_gex'],
+    ))
+
+    # ── Layer 3: Net GEX line — purple, combined dealer position ─────────────
+    fig.add_trace(go.Scatter(
+        y=df_s['strike'], x=df_s['net_gex'],
+        mode='lines+markers', line=dict(color='#a78bfa', width=2),
+        marker=dict(size=5, color='#8b5cf6'),
+        name='Net GEX (dealer position)',
+        hovertemplate='Strike: %{y:,.0f}<br>Net GEX: %{x:.4f}' + unit_label + '<extra></extra>',
+    ))
+
+    # ── Layer 4: Enhanced OI GEX — purple/gold, fresh intraday positioning ────
+    enh_colors = ['rgba(139,92,246,0.60)' if x >= 0 else 'rgba(245,158,11,0.60)'
                   for x in df_s['enhanced_oi_gex']]
     fig.add_trace(go.Bar(
         y=df_s['strike'], x=df_s['enhanced_oi_gex'], orientation='h',
-        marker=dict(color=enh_colors, line=dict(color='rgba(255,255,255,0.3)', width=1)),
-        name=f'Enhanced OI GEX — Max: {max_enh:.4f}{unit_label}',
-        hovertemplate='Strike: %{y:,.0f}<br>Enh OI GEX: %{x:.4f}' + unit_label + '<extra></extra>',
-        width=0.4,
+        marker=dict(color=enh_colors, line=dict(color='rgba(255,255,255,0.3)', width=0.5)),
+        name='Enhanced OI GEX (fresh positioning)',
+        hovertemplate='Strike: %{y:,.0f}<br>Enh GEX: %{x:.4f}' + unit_label + '<extra></extra>',
+        width=0.3, opacity=0.55,
     ))
 
-    # Volume overlay as semi-transparent scatter lines on secondary x-axis
-    # For horizontal bar charts, we overlay volume as thin bars scaled to GEX range
+    # ── Layer 5: Volume overlay — very faint background ──────────────────────
     if 'call_volume' in df_s.columns and 'put_volume' in df_s.columns:
-        max_vol  = max(float(df_s['call_volume'].max()), float(df_s['put_volume'].max()), 1)
-        max_gex2 = max(df_s['net_gex'].abs().max(), df_s['enhanced_oi_gex'].abs().max(), 1)
-        vol_scale = max_gex2 * 0.5 / max_vol  # scale vol to 50% of gex range
-        cv_scaled = df_s['call_volume'].fillna(0) * vol_scale
-        pv_scaled = df_s['put_volume'].fillna(0)  * vol_scale
+        max_vol   = max(float(df_s['call_volume'].max()), float(df_s['put_volume'].max()), 1)
+        vol_scale = max(max_call, max_put, 0.01) * 0.30 / max_vol
         fig.add_trace(go.Bar(
-            y=df_s['strike'], x=cv_scaled,
-            orientation='h', name='Call Vol (scaled)',
-            marker=dict(color='rgba(16,185,129,0.20)', line=dict(width=0)),
-            showlegend=True,
+            y=df_s['strike'], x=df_s['call_volume'].fillna(0) * vol_scale,
+            orientation='h', name='Call Volume',
+            marker=dict(color='rgba(16,185,129,0.10)', line=dict(width=0)),
             hovertemplate='Strike: %{y:,.0f}<br>Call Vol: %{customdata:,.0f}<extra></extra>',
             customdata=df_s['call_volume'].fillna(0),
         ))
         fig.add_trace(go.Bar(
-            y=df_s['strike'], x=-pv_scaled,
-            orientation='h', name='Put Vol (scaled)',
-            marker=dict(color='rgba(239,68,68,0.20)', line=dict(width=0)),
-            showlegend=True,
+            y=df_s['strike'], x=-df_s['put_volume'].fillna(0) * vol_scale,
+            orientation='h', name='Put Volume',
+            marker=dict(color='rgba(239,68,68,0.10)', line=dict(width=0)),
             hovertemplate='Strike: %{y:,.0f}<br>Put Vol: %{customdata:,.0f}<extra></extra>',
             customdata=df_s['put_volume'].fillna(0),
         ))
-
     # Spot line
     fig.add_hline(y=spot_price,
                   line=dict(color='#fbbf24', width=2.5, dash='dash'),
@@ -2680,11 +2721,12 @@ def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float
 
     fig.update_layout(
         title=(
-            f'{emoj} {symbol} Enhanced GEX Overlay — '
-            f'Green/Red = Standard GEX | Purple/Gold = Enhanced OI GEX | Faint = Volume'
+            f'{emoj} {symbol} GEX Overlay — '
+            f'🟢 Call GEX (Long γ) | 🔴 Put GEX (Short γ) | '
+            f'Purple = Net | Gold/Purple = Enhanced'
         ),
         xaxis=dict(
-            title=f'GEX ({unit_label})  /  Volume (scaled)',
+            title=f'GEX ({unit_label}) — positive = call side — zero line = GEX flip — negative = put side',
             zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
             gridcolor='rgba(128,128,128,0.15)',
         ),
@@ -2700,7 +2742,7 @@ def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float
         ),
         annotations=[dict(
             x=0.01, y=0.01, xref='paper', yref='paper',
-            text='Green/Red (semi) = Standard GEX &nbsp;|&nbsp; Purple/Gold (solid) = Enhanced OI GEX &nbsp;|&nbsp; Faint = Volume overlay',
+            text='🟢 Call GEX = dealers long γ, absorbs rally &nbsp;|&nbsp; 🔴 Put GEX = dealers short γ, amplifies drop &nbsp;|&nbsp; Purple line = Net dealer position &nbsp;|&nbsp; Zero = GEX flip level',
             font=dict(size=9, color='#64748b'), showarrow=False,
         )],
     )
