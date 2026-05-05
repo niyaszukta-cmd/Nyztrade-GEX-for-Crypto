@@ -633,9 +633,14 @@ def delta_get_ticker(symbol: str) -> dict:
     Fetch live ticker for one instrument.
     Endpoint: GET /v2/tickers/{symbol}
     Returns: mark_price, OI, greeks (delta, gamma, theta, vega, rho), IV
+    Always returns a dict (guards against list or None responses).
     """
-    resp = delta_get(f"/v2/tickers/{symbol}")
-    return resp.get('result', {})
+    resp   = delta_get(f"/v2/tickers/{symbol}")
+    result = resp.get('result', {})
+    # Delta sometimes returns result as a list — extract first element
+    if isinstance(result, list):
+        result = result[0] if result else {}
+    return result if isinstance(result, dict) else {}
 
 
 def delta_get_all_tickers(contract_type: str = 'options') -> list:
@@ -686,23 +691,36 @@ def delta_get_expiries(currency: str) -> list:
 def delta_get_spot_price(currency: str) -> float:
     """
     Get current spot/mark price for a currency pair.
-    Uses the perpetual futures ticker as spot proxy.
+    XAU: uses Massive.com Forex API (live Gold spot).
+    BTC/ETH: uses Delta Exchange India perpetual futures ticker.
+    massive_get_xau_spot() is defined later in this file — Python
+    resolves it at call-time, not definition-time.
     """
-    symbol_map = {'BTC': 'BTCUSD', 'ETH': 'ETHUSD', 'XAU': 'XAUUSD'}
+    # XAU — route to Massive.com for live Gold spot price
+    if currency == 'XAU':
+        try:
+            # massive_get_xau_spot defined at line ~1423
+            return massive_get_xau_spot()
+        except Exception:
+            return 3100.0
+
+    symbol_map = {'BTC': 'BTCUSD', 'ETH': 'ETHUSD'}
     symbol = symbol_map.get(currency, f"{currency}USD")
-    ticker = delta_get_ticker(symbol)
-
-    # Try mark_price → close → spot_price in order
-    for key in ['mark_price', 'close', 'spot_price']:
-        val = ticker.get(key)
-        if val:
-            try:
-                return float(val)
-            except Exception:
-                pass
-
-    # Fallback defaults
-    return {'BTC': 83000.0, 'ETH': 1800.0, 'XAU': 3100.0}.get(currency, 0.0)
+    try:
+        ticker = delta_get_ticker(symbol)
+        # Guard: result can be a list on some Delta API responses
+        if not isinstance(ticker, dict):
+            ticker = {}
+        for key in ['mark_price', 'close', 'spot_price']:
+            val = ticker.get(key)
+            if val:
+                try:
+                    return float(val)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {'BTC': 83000.0, 'ETH': 1800.0}.get(currency, 0.0)
 
 
 def fetch_options_chain_delta(currency: str, expiry: str,
