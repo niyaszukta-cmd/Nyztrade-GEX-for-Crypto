@@ -1413,30 +1413,289 @@ def _compute_enhanced_oi_gex_crypto(df: pd.DataFrame,
 
 
 # ============================================================================
-# POLYGON.IO — COMEX GOLD (XAU) OPTIONS
-# Free tier: 5 API calls/min. Starter: $29/month for full options chain.
-# Sign up: https://polygon.io (free account → get API key immediately)
-# Add to .streamlit/secrets.toml: POLYGON_API_KEY = "your_key_here"
+# BARCHART ONDEMAND — COMEX GOLD (XAU) OPTIONS CHAIN
+# Plan required: Starter $29/month — gives access to getFuturesOptions
+# Sign up: https://www.barchart.com/ondemand/api
+# Docs: https://www.barchart.com/ondemand/api/getFuturesOptions
+# Endpoint: GET /getFuturesOptions.json
+#   ?apikey=KEY&root=GC&exchange=COMEX&type=Call|Put
+#   &fields=openInterest,volume,impliedVolatility,delta,gamma
+# GC month codes: F=Jan G=Feb H=Mar J=Apr K=May M=Jun
+#                 N=Jul Q=Aug U=Sep V=Oct X=Nov Z=Dec
+# Example contract: GCM26 = Gold June 2026
 # ============================================================================
+POLYGON_BASE = "https://api.polygon.io"  # kept for compatibility
 
-POLYGON_BASE = "https://api.polygon.io"
+BARCHART_BASE    = "https://ondemand.websol.barchart.com"
+BARCHART_API_KEY = "YOUR_BARCHART_API_KEY"  # <-- replace with your key
+
+# COMEX Gold month codes for GC futures symbol construction
+_GC_MONTH_CODES = {1:'F',2:'G',3:'H',4:'J',5:'K',6:'M',
+                   7:'N',8:'Q',9:'U',10:'V',11:'X',12:'Z'}
 
 # ============================================================================
-# MASSIVE.COM — FOREX / GOLD SPOT PRICE
+# MASSIVE.COM — FOREX / GOLD SPOT PRICE (live XAU/USD)
 # API Key: dC2ATLT4pZTNIG95tmDdXA0kZsYVh5tV  (nyztrade account)
 # Docs: https://massive.com/docs/rest/forex/quotes/last-quote
-# Endpoint: GET /v1/forex/{from}/{to}/last?apiKey=KEY
-# Returns: { results: { ask, bid, exchange, t }, status, request_id }
-# XAU/USD = Gold spot price in USD
-# NOTE: Massive provides spot FX/Gold data only — no options chain.
-#       Options chain is synthesised via Black-Scholes with realistic IV smile.
+# Endpoint: GET /v1/forex/XAU/USD/last?apiKey=KEY
 # ============================================================================
 MASSIVE_BASE    = "https://api.massive.com"
 MASSIVE_API_KEY = "dC2ATLT4pZTNIG95tmDdXA0kZsYVh5tV"
 
 def get_polygon_api_key() -> str:
-    """Kept for compatibility — Polygon replaced by Massive for XAU."""
+    """Kept for compatibility — Polygon replaced by Barchart for XAU."""
     return ""
+
+
+def _gc_contract_symbol(expiry_str: str) -> str:
+    """
+    Convert expiry string (e.g. '20JUN26') to COMEX GC contract symbol
+    e.g. 'GCM26' (Gold June 2026).
+    Barchart requires the underlying futures contract symbol, not the option symbol.
+    """
+    try:
+        exp_dt = datetime.strptime(expiry_str, '%d%b%y')
+        code   = _GC_MONTH_CODES.get(exp_dt.month, 'M')
+        return f"GC{code}{exp_dt.strftime('%y')}"
+    except Exception:
+        return "GCM26"
+
+
+def barchart_get_gold_expiries() -> list:
+    """
+    Fetch available COMEX Gold options expiry dates from Barchart.
+    Endpoint: getFuturesOptionsExpirations?root=GC&exchange=COMEX
+    Returns list of expiry strings in DDMMMYY format e.g. ['20JUN26','18JUL26']
+    Falls back to generated monthly dates if API unavailable.
+    """
+    if BARCHART_API_KEY == "YOUR_BARCHART_API_KEY":
+        # Key not set — return computed COMEX monthly expiries
+        return _generate_comex_expiries()
+    try:
+        r = requests.get(
+            f"{BARCHART_BASE}/getFuturesOptionsExpirations.json",
+            params={"apikey": BARCHART_API_KEY, "roots": "GC", "exchange": "COMEX"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            results = r.json().get("results", [])
+            expiries = []
+            seen = set()
+            for item in results:
+                exp_date = item.get("expirationDate", "")
+                if exp_date and exp_date not in seen:
+                    try:
+                        dt = datetime.strptime(exp_date, "%Y-%m-%d")
+                        if dt >= datetime.utcnow():
+                            expiries.append(dt.strftime("%d%b%y").upper())
+                            seen.add(exp_date)
+                    except Exception:
+                        pass
+            if expiries:
+                return sorted(expiries)[:8]
+    except Exception:
+        pass
+    return _generate_comex_expiries()
+
+
+def _generate_comex_expiries() -> list:
+    """Generate next 6 COMEX Gold monthly expiry dates (3rd Friday of month)."""
+    today   = datetime.utcnow()
+    result  = []
+    for m in range(6):
+        first = (today.replace(day=1) + timedelta(days=32 * m)).replace(day=1)
+        fridays, d = 0, first
+        while fridays < 3:
+            if d.weekday() == 4:
+                fridays += 1
+            if fridays < 3:
+                d += timedelta(days=1)
+        if d >= today:
+            result.append(d.strftime("%d%b%y").upper())
+    return result if result else ["20JUN26", "18JUL26", "15AUG26"]
+
+
+def fetch_options_chain_xau_barchart(expiry_str: str,
+                                      spot_price: float,
+                                      atm_range: int = 15) -> pd.DataFrame:
+    """
+    Fetch COMEX Gold (GC) options chain from Barchart OnDemand.
+    Returns real OI per strike. Greeks are synthesised via Black-Scholes
+    from the real IV returned by Barchart (or BS fallback if IV absent).
+
+    Endpoint: GET /getFuturesOptions.json
+    Params:
+      root=GC  exchange=COMEX  type=Call|Put
+      fields=openInterest,volume,impliedVolatility,delta,gamma
+
+    Requires BARCHART_API_KEY set to a valid Starter+ plan key.
+    Falls back to fetch_options_chain_xau_massive() if key absent or API fails.
+
+    expiry_str: DDMMMYY format, e.g. '20JUN26'
+    """
+    # ── Key check — fallback to BS model if key not set ─────────────────────
+    if BARCHART_API_KEY == "YOUR_BARCHART_API_KEY":
+        st.info(
+            "🔑 **Barchart API key not set.** Using BS-synthesised Gold chain. "
+            "Add your Barchart Starter key to `BARCHART_API_KEY` in the code "
+            "to get real COMEX OI data. Sign up: barchart.com/ondemand/api"
+        )
+        return fetch_options_chain_xau_massive(expiry_str, spot_price, atm_range)
+
+    cfg         = CRYPTO_CONFIG["XAU"]
+    unit_div    = cfg["unit_divisor"]
+    strike_int  = cfg["strike_interval"]
+    contract    = _gc_contract_symbol(expiry_str)
+
+    # ── Parse TTE ────────────────────────────────────────────────────────────
+    try:
+        exp_dt = datetime.strptime(expiry_str, "%d%b%y")
+        tte    = max((exp_dt - datetime.utcnow()).days / 365.0, 1 / 365.0)
+    except Exception:
+        tte = 30 / 365.0
+
+    # ── Fetch Calls ───────────────────────────────────────────────────────────
+    def _fetch_side(opt_type: str) -> list:
+        try:
+            r = requests.get(
+                f"{BARCHART_BASE}/getFuturesOptions.json",
+                params={
+                    "apikey":   BARCHART_API_KEY,
+                    "root":     "GC",
+                    "contract": contract,
+                    "exchange": "COMEX",
+                    "type":     opt_type,
+                    "fields":   "openInterest,volume,impliedVolatility,delta,gamma",
+                },
+                timeout=15,
+            )
+            if r.status_code == 200:
+                return r.json().get("results", [])
+        except Exception:
+            pass
+        return []
+
+    with st.spinner(f"Fetching COMEX Gold {contract} options from Barchart..."):
+        call_results = _fetch_side("Call")
+        put_results  = _fetch_side("Put")
+
+    if not call_results and not put_results:
+        st.warning(
+            f"⚠️ Barchart returned no data for {contract}. "
+            "Check your API key and plan level. Using BS model as fallback."
+        )
+        return fetch_options_chain_xau_massive(expiry_str, spot_price, atm_range)
+
+    # ── Build per-strike dict from call side ──────────────────────────────────
+    S       = float(spot_price)
+    r_rate  = 0.05
+    sqrtT   = np.sqrt(tte)
+    atm     = round(S / strike_int) * strike_int
+    lo, hi  = atm - atm_range * strike_int, atm + atm_range * strike_int
+
+    strikes_data: dict[float, dict] = {}
+
+    for row in call_results:
+        k = float(row.get("strike", 0))
+        if k < lo or k > hi or k <= 0:
+            continue
+        strikes_data[k] = {
+            "call_oi":     float(row.get("openInterest", 0) or 0),
+            "call_volume": float(row.get("volume", 0) or 0),
+            "call_iv":     float(row.get("impliedVolatility", 0) or 0),
+            "put_oi": 0.0, "put_volume": 0.0, "put_iv": 0.0,
+        }
+
+    for row in put_results:
+        k = float(row.get("strike", 0))
+        if k < lo or k > hi or k <= 0:
+            continue
+        if k not in strikes_data:
+            strikes_data[k] = {"call_oi": 0.0, "call_volume": 0.0, "call_iv": 0.0}
+        strikes_data[k]["put_oi"]     = float(row.get("openInterest", 0) or 0)
+        strikes_data[k]["put_volume"] = float(row.get("volume", 0) or 0)
+        strikes_data[k]["put_iv"]     = float(row.get("impliedVolatility", 0) or 0)
+
+    if not strikes_data:
+        st.warning("No strikes in ATM range from Barchart. Using BS fallback.")
+        return fetch_options_chain_xau_massive(expiry_str, spot_price, atm_range)
+
+    K_arr = np.array(sorted(strikes_data.keys()), dtype=float)
+
+    # ── Extract real OI and IV ────────────────────────────────────────────────
+    call_oi  = np.array([strikes_data[k]["call_oi"]     for k in K_arr])
+    put_oi   = np.array([strikes_data[k]["put_oi"]      for k in K_arr])
+    call_vol = np.array([strikes_data[k]["call_volume"] for k in K_arr])
+    put_vol  = np.array([strikes_data[k]["put_volume"]  for k in K_arr])
+
+    # Use Barchart IV where available; fill zeros with BS Gold smile
+    c_iv_raw = np.array([strikes_data[k].get("call_iv", 0.0) for k in K_arr])
+    p_iv_raw = np.array([strikes_data[k].get("put_iv",  0.0) for k in K_arr])
+
+    # Synthesise Gold IV smile as fallback for missing strikes
+    base_iv = max(15.0, min(25.0, 18.0 + (tte * 365 - 30) * 0.05))
+    c_iv_synth, p_iv_synth = _build_xau_iv_smile(S, K_arr, tte, base_iv)
+
+    # Use real IV if > 0, else synthesised smile
+    c_iv_pct = np.where(c_iv_raw > 0, c_iv_raw, c_iv_synth)
+    p_iv_pct = np.where(p_iv_raw > 0, p_iv_raw, p_iv_synth)
+
+    # Clamp to realistic range
+    c_iv_pct = np.clip(c_iv_pct, 8.0, 80.0)
+    p_iv_pct = np.clip(p_iv_pct, 8.0, 80.0)
+    c_iv_f   = c_iv_pct / 100.0
+    p_iv_f   = p_iv_pct / 100.0
+
+    # ── Synthesise Greeks from real IV (BS) ───────────────────────────────────
+    def _d1(iv):
+        return (np.log(S / np.maximum(K_arr, 1e-6)) +
+                (r_rate + 0.5 * iv**2) * tte) / np.maximum(iv * sqrtT, 1e-10)
+
+    c_d1  = _d1(c_iv_f);  p_d1  = _d1(p_iv_f)
+    c_d2  = c_d1 - c_iv_f * sqrtT
+    p_d2  = p_d1 - p_iv_f * sqrtT
+
+    c_gamma = norm.pdf(c_d1) / np.maximum(S * c_iv_f * sqrtT, 1e-10)
+    p_gamma = norm.pdf(p_d1) / np.maximum(S * p_iv_f * sqrtT, 1e-10)
+    c_vanna = -norm.pdf(c_d1) * c_d2 / np.maximum(c_iv_f, 1e-10)
+    p_vanna = -norm.pdf(p_d1) * p_d2 / np.maximum(p_iv_f, 1e-10)
+    c_delta = norm.cdf(c_d1)
+    p_delta = norm.cdf(p_d1) - 1.0
+
+    # ── Build DataFrame ───────────────────────────────────────────────────────
+    df = pd.DataFrame({
+        "strike":      K_arr,
+        "call_oi":     call_oi.astype(int),
+        "put_oi":      put_oi.astype(int),
+        "call_volume": call_vol.astype(int),
+        "put_volume":  put_vol.astype(int),
+        "call_iv":     c_iv_pct,
+        "put_iv":      p_iv_pct,
+        "call_delta":  c_delta,
+        "put_delta":   p_delta,
+        "call_gamma":  c_gamma,
+        "put_gamma":   p_gamma,
+        "call_vanna":  c_vanna,
+        "put_vanna":   p_vanna,
+    })
+
+    # ── Compute GEX / VANNA / DEX ─────────────────────────────────────────────
+    df["call_gex"]  = df["call_oi"] * df["call_gamma"] * S**2 / unit_div
+    df["put_gex"]   = df["put_oi"]  * df["put_gamma"]  * S**2 / unit_div
+    df["net_gex"]   = df["call_gex"] - df["put_gex"]
+    df["net_vanna"] = (df["call_oi"] * df["call_vanna"] -
+                       df["put_oi"]  * df["put_vanna"]) / unit_div
+    df["net_dex"]   = (df["call_oi"] * df["call_delta"] +
+                       df["put_oi"]  * df["put_delta"]) / unit_div
+    df["total_volume"]   = df["call_volume"] + df["put_volume"]
+    df["call_oi_change"] = 0.0
+    df["put_oi_change"]  = 0.0
+    df["spot_price"]     = S
+    df["timestamp"]      = datetime.utcnow().replace(tzinfo=pytz.utc)
+    df["_oi_synthetic"]  = False   # real OI from Barchart
+
+    df = _compute_enhanced_oi_gex_crypto(df, S, cfg["unit_label"])
+    return df
 
 
 def massive_get_xau_spot() -> float:
@@ -1797,7 +2056,8 @@ def fetch_options_chain(currency: str, expiry: str,
     (Delta Exchange and Deribit do not list XAU options).
     """
     if currency == 'XAU':
-        return fetch_options_chain_xau_massive(expiry, spot_price, atm_range)
+        # Use Barchart for real OI (falls back to BS model if key not set)
+        return fetch_options_chain_xau_barchart(expiry, spot_price, atm_range)
     if data_source == 'deribit':
         return fetch_options_chain_deribit(currency, expiry, spot_price, atm_range)
     return fetch_options_chain_delta(currency, expiry, spot_price, atm_range)
@@ -1809,21 +2069,8 @@ def get_expiries(currency: str, data_source: str = 'delta') -> list:
     XAU generates standard COMEX monthly expiries (no exchange call needed).
     """
     if currency == 'XAU':
-        # Generate next 6 monthly expiries (3rd Friday of each month)
-        from datetime import date
-        today  = date.today()
-        result = []
-        for m in range(6):
-            first = (today.replace(day=1) + __import__('datetime').timedelta(days=32 * m)).replace(day=1)
-            fridays, d = 0, first
-            while fridays < 3:
-                if d.weekday() == 4:
-                    fridays += 1
-                if fridays < 3:
-                    d += __import__('datetime').timedelta(days=1)
-            if d >= today:
-                result.append(d.strftime('%d%b%y').upper())
-        return result if result else ['20JUN26', '18JUL26', '15AUG26']
+        # Fetch real COMEX expiry dates from Barchart (falls back to computed)
+        return barchart_get_gold_expiries()
     if data_source == 'deribit':
         return deribit_get_expiries(currency)
     if data_source == 'massive':
@@ -3262,11 +3509,18 @@ def main():
                 f"Synthetic ${target_iv} strikes added via Black-Scholes interpolation."
             )
         if currency == 'XAU':
-            st.success(
-                "🥇 Gold (XAU/USD) — Live spot via Massive.com Forex API\n"
-                "Options: BS-synthesised with realistic Gold IV smile\n"
-                "Account: nyztrade | Real-time spot price"
-            )
+            if BARCHART_API_KEY != "YOUR_BARCHART_API_KEY":
+                st.success(
+                    "🥇 Gold (XAU/USD) — Real COMEX OI from Barchart OnDemand\n"
+                    "Spot: live via Massive.com | Greeks: BS-synthesised from real IV\n"
+                    "Data source: barchart.com/ondemand"
+                )
+            else:
+                st.warning(
+                    "🔑 Barchart key not set — BS-synthesised OI in use\n"
+                    "Set BARCHART_API_KEY in code for real COMEX OI\n"
+                    "Spot: live via Massive.com (nyztrade)"
+                )
 
         st.markdown("---")
 
@@ -3489,13 +3743,19 @@ def main():
             pass
         if _is_synthetic:
             if currency == 'XAU':
-                st.info(
-                    "🥇 **Gold (XAU/USD) — Live Spot via Massive.com Forex API** | "
-                    "Options chain is BS-synthesised with realistic Gold IV smile + "
-                    "log-normal OI distribution (put-heavy, reflecting actual hedging demand). "
-                    "GEX/VANNA structure shows theoretical dealer positioning. "
-                    "Spot price is real-time from Massive.com (nyztrade account)."
-                )
+                if BARCHART_API_KEY == "YOUR_BARCHART_API_KEY":
+                    st.info(
+                        "🔑 **Gold (XAU/USD) — BS-Synthesised Mode** | "
+                        "Barchart API key not set. Set `BARCHART_API_KEY` in code for real COMEX OI. "
+                        "Spot is live from Massive.com. Options chain uses Black-Scholes + Gold IV smile. "
+                        "Sign up free trial: barchart.com/ondemand/api"
+                    )
+                else:
+                    st.info(
+                        "🥇 **Gold (XAU/USD) — BS-Synthesised fallback** | "
+                        "Barchart returned no data for this expiry. "
+                        "Using BS model with Gold IV smile. Check contract symbol and plan level."
+                    )
             else:
                 st.info(
                     "ℹ️ **Theoretical Mode**: Delta Exchange did not return OI data for this expiry. "
