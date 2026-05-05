@@ -131,6 +131,7 @@ DERIBIT_BASE = "https://www.deribit.com/api/v2"
 DATA_SOURCES = {
     'delta':   '🇮🇳 Delta Exchange India',
     'deribit': '🌍 Deribit (Global)',
+    'massive': '🥇 Massive.com (Gold/XAU)',
 }
 
 # ── Contract Specs ──────────────────────────────────────────────────────────
@@ -1811,6 +1812,8 @@ def get_expiries(currency: str, data_source: str = 'delta') -> list:
         return result if result else ['20JUN26', '18JUL26', '15AUG26']
     if data_source == 'deribit':
         return deribit_get_expiries(currency)
+    if data_source == 'massive':
+        return []  # XAU already handled above; non-XAU on massive is not supported
     return delta_get_expiries(currency)
 
 
@@ -1826,6 +1829,8 @@ def get_spot(currency: str, data_source: str = 'delta') -> float:
             return 3100.0
     if data_source == 'deribit':
         return deribit_get_spot_price(currency)
+    if data_source == 'massive':
+        return delta_get_spot_price(currency)  # XAU already handled above
     return delta_get_spot_price(currency)
 
 
@@ -3157,19 +3162,28 @@ def main():
 
         # ── Data Source selector ─────────────────────────────────────────
         st.markdown("### 🔌 Data Source")
+        # Currency must be read first to determine available sources
+        _currency_peek = st.session_state.get('_currency_peek', 'BTC')
+        _xau_selected  = (_currency_peek == 'XAU')
+        _ds_options    = ['massive'] if _xau_selected else ['delta', 'deribit']
+        _ds_default    = 0
         data_source = st.radio(
             "Provider",
-            options=['delta', 'deribit'],
+            options=_ds_options,
             format_func=lambda x: DATA_SOURCES[x],
-            index=0,
+            index=_ds_default,
             horizontal=True,
             help=(
-                "Delta Exchange India: Indian crypto exchange, INR-friendly\n"
-                "Deribit: Global crypto options leader, deeper BTC/ETH/XAU liquidity"
+                "Delta Exchange India: Indian crypto exchange (BTC/ETH)\n"
+                "Deribit: Global crypto options (BTC/ETH)\n"
+                "Massive.com: Live XAU/Gold spot (auto-selected for Gold)"
             ),
+            disabled=_xau_selected,
         )
-        # Show provider info
-        if data_source == 'delta':
+        if _xau_selected:
+            data_source = 'massive'
+            st.caption("🥇 Massive.com Forex API — Live XAU/USD spot · BS-synthesised chain")
+        elif data_source == 'delta':
             st.caption("🇮🇳 api.india.delta.exchange — Free public API")
         else:
             st.caption("🌍 www.deribit.com — Free public API · Best BTC/ETH/XAU liquidity")
@@ -3179,6 +3193,8 @@ def main():
 
         currency = st.selectbox("🪙 Asset", ["BTC", "ETH", "XAU"],
                                  format_func=lambda x: {"BTC":"₿ Bitcoin","ETH":"🔷 Ethereum","XAU":"🥇 Gold (XAU)"}[x])
+        # Store currency for data_source radio above (Streamlit reruns handle ordering)
+        st.session_state['_currency_peek'] = currency
         cfg = CRYPTO_CONFIG[currency]
 
         # Clear cached data when user switches asset OR data source
@@ -3422,14 +3438,29 @@ def main():
             st.error("No data available for this expiry. Try another expiry date.")
             return
 
-        # Warn if OI was synthesised (Delta API returned zero OI)
-        if df.get('_oi_synthetic', pd.Series([False])).any() if hasattr(df.get('_oi_synthetic', None), 'any') else df.get('_oi_synthetic', [False])[0] if '_oi_synthetic' in df.columns and len(df) > 0 else False:
-            st.info(
-                "ℹ️ **Theoretical Mode**: Delta Exchange did not return OI data for this expiry. "
-                "OI distribution is estimated using log-normal model (same as SpotGamma for sparse markets). "
-                "GEX/VANNA structure reflects theoretical dealer positioning based on IV smile. "
-                "Charts will update with real OI when Delta Exchange provides it."
-            )
+        # Show appropriate info banner depending on data mode
+        _is_synthetic = False
+        try:
+            if '_oi_synthetic' in df.columns and len(df) > 0:
+                _is_synthetic = bool(df['_oi_synthetic'].iloc[0])
+        except Exception:
+            pass
+        if _is_synthetic:
+            if currency == 'XAU':
+                st.info(
+                    "🥇 **Gold (XAU/USD) — Live Spot via Massive.com Forex API** | "
+                    "Options chain is BS-synthesised with realistic Gold IV smile + "
+                    "log-normal OI distribution (put-heavy, reflecting actual hedging demand). "
+                    "GEX/VANNA structure shows theoretical dealer positioning. "
+                    "Spot price is real-time from Massive.com (nyztrade account)."
+                )
+            else:
+                st.info(
+                    "ℹ️ **Theoretical Mode**: Delta Exchange did not return OI data for this expiry. "
+                    "OI distribution is estimated using log-normal model (same as SpotGamma for sparse markets). "
+                    "GEX/VANNA structure reflects theoretical dealer positioning based on IV smile. "
+                    "Charts will update with real OI when Delta Exchange provides it."
+                )
 
         # ── Top metrics ───────────────────────────────────────────────────────
         net_gex_total   = df['net_gex'].sum()
