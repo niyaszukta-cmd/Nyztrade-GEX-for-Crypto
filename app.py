@@ -1776,27 +1776,57 @@ def fetch_options_chain_deribit(currency: str, expiry: str,
 def fetch_options_chain(currency: str, expiry: str,
                          spot_price: float, atm_range: int,
                          data_source: str = 'delta') -> pd.DataFrame:
-    """Route to Delta Exchange or Deribit based on user selection."""
+    """
+    Route options chain fetch to correct provider.
+    XAU always uses Massive.com spot + BS-synthesised chain
+    (Delta Exchange and Deribit do not list XAU options).
+    """
+    if currency == 'XAU':
+        return fetch_options_chain_xau_massive(expiry, spot_price, atm_range)
     if data_source == 'deribit':
         return fetch_options_chain_deribit(currency, expiry, spot_price, atm_range)
-    else:
-        return fetch_options_chain_delta(currency, expiry, spot_price, atm_range)
+    return fetch_options_chain_delta(currency, expiry, spot_price, atm_range)
 
 
 def get_expiries(currency: str, data_source: str = 'delta') -> list:
-    """Route expiry fetching to correct provider."""
+    """
+    Route expiry fetching to correct provider.
+    XAU generates standard COMEX monthly expiries (no exchange call needed).
+    """
+    if currency == 'XAU':
+        # Generate next 6 monthly expiries (3rd Friday of each month)
+        from datetime import date
+        today  = date.today()
+        result = []
+        for m in range(6):
+            first = (today.replace(day=1) + __import__('datetime').timedelta(days=32 * m)).replace(day=1)
+            fridays, d = 0, first
+            while fridays < 3:
+                if d.weekday() == 4:
+                    fridays += 1
+                if fridays < 3:
+                    d += __import__('datetime').timedelta(days=1)
+            if d >= today:
+                result.append(d.strftime('%d%b%y').upper())
+        return result if result else ['20JUN26', '18JUL26', '15AUG26']
     if data_source == 'deribit':
         return deribit_get_expiries(currency)
-    else:
-        return delta_get_expiries(currency)
+    return delta_get_expiries(currency)
 
 
 def get_spot(currency: str, data_source: str = 'delta') -> float:
-    """Route spot price to correct provider."""
+    """
+    Route spot price to correct provider.
+    XAU always uses Massive.com Forex API for live Gold price.
+    """
+    if currency == 'XAU':
+        try:
+            return massive_get_xau_spot()
+        except Exception:
+            return 3100.0
     if data_source == 'deribit':
         return deribit_get_spot_price(currency)
-    else:
-        return delta_get_spot_price(currency)
+    return delta_get_spot_price(currency)
 
 
 # ============================================================================
@@ -3211,27 +3241,15 @@ def main():
             st.session_state.pop('expiries', None)
 
         if currency == 'XAU':
-            # XAU uses Polygon.io — generate standard COMEX monthly expiries
+            # XAU — expiries from get_expiries (monthly COMEX 3rd Fridays)
             st.info("🥇 Gold XAU/USD — select monthly expiry (3rd Friday).")
-            today = datetime.utcnow()
-            # COMEX Gold options: monthly expiries on 3rd Friday
-            xau_expiries = []
-            for m in range(0, 6):
-                # First day of month offset
-                month_dt = (today.replace(day=1) + timedelta(days=32*m)).replace(day=1)
-                # Find 3rd Friday
-                fridays = 0
-                d = month_dt
-                while fridays < 3:
-                    if d.weekday() == 4:
-                        fridays += 1
-                    if fridays < 3:
-                        d += timedelta(days=1)
-                if d > today:
-                    xau_expiries.append(d.strftime('%d%b%y').upper())
-            expiries = xau_expiries if xau_expiries else ['18APR26','16MAY26','20JUN26']
-            st.session_state['expiries']        = expiries
-            st.session_state['expiry_currency'] = currency
+            if 'expiries' not in st.session_state or \
+               st.session_state.get('expiry_currency') != currency:
+                expiries = get_expiries(currency, data_source)
+                st.session_state['expiries']        = expiries
+                st.session_state['expiry_currency'] = currency
+            else:
+                expiries = st.session_state['expiries']
         else:
             if 'expiries' not in st.session_state or \
                st.session_state.get('expiry_currency') != currency:
