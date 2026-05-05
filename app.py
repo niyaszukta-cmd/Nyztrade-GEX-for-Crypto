@@ -123,6 +123,8 @@ st.markdown("""
 # ============================================================================
 
 DELTA_BASE   = "https://api.india.delta.exchange"
+DELTA_API_KEY    = "I3SzejlwRZ7R3ZEQG5XofZI9OD5uNl"
+DELTA_API_SECRET = "YyoCmF80F9nDd4paOv2vnVPX0wdW7JGLMpObo5clgOfEDRA12UmwwXyTLqgx"
 DERIBIT_BASE = "https://www.deribit.com/api/v2"
 
 # Data source labels
@@ -1401,11 +1403,8 @@ def _compute_enhanced_oi_gex_crypto(df: pd.DataFrame,
 POLYGON_BASE = "https://api.polygon.io"
 
 def get_polygon_api_key() -> str:
-    """Retrieve Polygon API key from Streamlit secrets."""
-    try:
-        return st.secrets.get("POLYGON_API_KEY", "")
-    except Exception:
-        return ""
+    """Return hardcoded Polygon API key."""
+    return ""  # Add your Polygon API key here if using XAU/Gold options
 
 def get_polygon_gold_snapshot(spot_price: float, expiry_date: str,
                                atm_range: int = 12) -> pd.DataFrame:
@@ -1834,6 +1833,48 @@ def create_snapshot_evolution_chart(history: list,
 # (Identical to India dashboard — market-agnostic math)
 # ============================================================================
 
+def _filter_strikes_near_spot(df: pd.DataFrame, spot_price: float,
+                               pct: float = 0.20) -> pd.DataFrame:
+    """Keep only strikes within ±pct of spot price for clear charts."""
+    if df.empty or spot_price <= 0:
+        return df
+    lo = spot_price * (1 - pct)
+    hi = spot_price * (1 + pct)
+    filtered = df[(df['strike'] >= lo) & (df['strike'] <= hi)]
+    # Fallback: if filter removes everything, return all
+    return filtered if len(filtered) >= 3 else df
+
+
+def _safe_iv_regime(df: pd.DataFrame) -> tuple:
+    """
+    Safely compute IV regime from df.
+    Works whether df has a timestamp column (time-series) or not (snapshot).
+    Returns (iv_regime_str, iv_skew_float, iv_color_str).
+    """
+    regime, skew, color = 'FLAT', 0.0, '#94a3b8'
+    try:
+        if 'timestamp' in df.columns and df['timestamp'].nunique() > 1:
+            iv_df = compute_iv_trend(df)
+            if not iv_df.empty and 'iv_regime' in iv_df.columns:
+                last   = iv_df.iloc[-1]
+                regime = str(last.get('iv_regime', 'FLAT'))
+                skew   = float(last.get('iv_skew', 0.0))
+        elif 'call_iv' in df.columns and 'put_iv' in df.columns:
+            avg = (df['call_iv'].fillna(65) + df['put_iv'].fillna(65)) / 2
+            mean_iv = avg.mean()
+            skew = float((df['call_iv'].fillna(65) - df['put_iv'].fillna(65)).mean())
+            # Use spread of IV across strikes as proxy for regime
+            iv_std = avg.std()
+            if iv_std > mean_iv * 0.08:
+                regime = 'EXPANDING'
+            elif iv_std < mean_iv * 0.03:
+                regime = 'COMPRESSING'
+    except Exception:
+        pass
+    color = {'EXPANDING': '#ef4444', 'COMPRESSING': '#10b981', 'FLAT': '#94a3b8'}.get(regime, '#94a3b8')
+    return regime, skew, color
+
+
 def identify_gamma_flip_zones(df: pd.DataFrame, spot_price: float) -> List[Dict]:
     df_sorted = df.sort_values('strike').reset_index(drop=True)
     flip_zones = []
@@ -2075,35 +2116,52 @@ def create_gex_chart(df: pd.DataFrame, spot_price: float,
     """Standard GEX bar chart — identical to India dashboard."""
     cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
     emoj = cfg['emoji']
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
+
+    for col in ['net_gex']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
 
     colors = ['#10b981' if v >= 0 else '#ef4444' for v in df_s['net_gex']]
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=df_s['strike'], x=df_s['net_gex'], orientation='h',
-        marker_color=colors,
+        marker=dict(color=colors, line=dict(color='rgba(255,255,255,0.15)', width=0.5)),
         hovertemplate='Strike: %{y:,.0f}<br>GEX: %{x:.4f}' + unit_label + '<extra></extra>',
         name='Net GEX',
     ))
-    fig.add_hline(y=spot_price, line=dict(color='#fbbf24', width=2, dash='dash'),
-                  annotation_text=f'Spot {spot_price:,.0f}',
-                  annotation_font=dict(color='#fbbf24', size=12))
+    fig.add_hline(y=spot_price, line=dict(color='#fbbf24', width=2.5, dash='dash'),
+                  annotation_text=f'Spot {spot_price:,.2f}',
+                  annotation_font=dict(color='#fbbf24', size=12),
+                  annotation_position='right')
 
     flip_zones = identify_gamma_flip_zones(df_s, spot_price)
-    for fz in flip_zones[:3]:
-        fig.add_hline(y=fz['strike'], line=dict(color=fz['color'], width=1, dash='dot'),
+    for fz in flip_zones[:5]:
+        fig.add_hline(y=fz['strike'], line=dict(color=fz['color'], width=1.5, dash='dot'),
                       annotation_text=f"Flip {fz['arrow']} {fz['strike']:,.0f}",
-                      annotation_font=dict(color=fz['color'], size=10))
+                      annotation_font=dict(color=fz['color'], size=10),
+                      annotation_position='right')
 
+    gex_pos = df_s[df_s['net_gex']>0]['net_gex'].sum()
+    gex_neg = df_s[df_s['net_gex']<0]['net_gex'].sum()
     fig.update_layout(
         title=f'{emoj} {symbol} Standard GEX — Gamma Exposure by Strike',
-        xaxis_title=f'Net GEX ({unit_label})',
-        yaxis_title='Strike Price (USD)',
-        height=600, template='plotly_dark',
-        plot_bgcolor='rgba(15,23,42,0.8)',
+        xaxis=dict(title=f'Net GEX ({unit_label})',
+                   zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
+                   gridcolor='rgba(128,128,128,0.15)'),
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
+        height=650, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.9)',
         paper_bgcolor='rgba(0,0,0,0)',
         font=dict(family='JetBrains Mono', color='#f1f5f9'),
-        showlegend=True,
+        showlegend=False,
+        annotations=[dict(
+            x=0.01, y=0.01, xref='paper', yref='paper',
+            text=f'Pos GEX: {gex_pos:.4f}{unit_label} | Neg GEX: {gex_neg:.4f}{unit_label} | '
+                 f'Net: {gex_pos+gex_neg:.4f}{unit_label}',
+            font=dict(size=9, color='#64748b'), showarrow=False,
+        )],
     )
     return fig
 
@@ -2115,7 +2173,11 @@ def create_enhanced_oi_gex_chart(df: pd.DataFrame, spot_price: float,
     emoj = cfg['emoji']
     if 'enhanced_oi_gex' not in df.columns:
         df = _compute_enhanced_oi_gex_crypto(df, spot_price, unit_label)
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
+    for col in ['enhanced_oi_gex']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
 
     colors = ['#8b5cf6' if v >= 0 else '#f59e0b' for v in df_s['enhanced_oi_gex']]
     fig = go.Figure()
@@ -2139,13 +2201,22 @@ def create_enhanced_oi_gex_chart(df: pd.DataFrame, spot_price: float,
                       annotation_text=role_icons[vz['role']] + ' ' + vz['role'].replace('_',' '),
                       annotation_font=dict(color=role_colors[vz['role']], size=10))
 
+    enh_pos = df_s['enhanced_oi_gex'].clip(lower=0).sum()
+    enh_neg = df_s['enhanced_oi_gex'].clip(upper=0).sum()
     fig.update_layout(
         title=f'{emoj} {symbol} Enhanced OI GEX — OI Change × Greeks × Vol × IV × Distance',
-        xaxis_title=f'Enhanced OI GEX ({unit_label})',
-        yaxis_title='Strike Price (USD)',
-        height=600, template='plotly_dark',
-        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(title=f'Enhanced OI GEX ({unit_label})',
+                   zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
+                   gridcolor='rgba(128,128,128,0.15)'),
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
+        height=650, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.9)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(family='JetBrains Mono', color='#f1f5f9'),
+        annotations=[dict(
+            x=0.01, y=0.01, xref='paper', yref='paper',
+            text=f'Pos: {enh_pos:.4f}{unit_label} | Neg: {enh_neg:.4f}{unit_label} | Net: {enh_pos+enh_neg:.4f}{unit_label}',
+            font=dict(size=9, color='#64748b'), showarrow=False,
+        )],
     )
     return fig
 
@@ -2154,7 +2225,10 @@ def create_vanna_chart(df: pd.DataFrame, spot_price: float,
                        unit_label: str = 'K', symbol: str = 'BTC') -> go.Figure:
     """VANNA exposure chart."""
     cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
+    if 'net_vanna' not in df_s.columns:
+        df_s['net_vanna'] = 0.0
+    df_s['net_vanna'] = df_s['net_vanna'].fillna(0)
 
     vanna_zones = identify_vanna_flip_zones(df_s, spot_price)
     colors = ['#ec4899' if v >= 0 else '#be185d' for v in df_s['net_vanna']]
@@ -2181,10 +2255,12 @@ def create_vanna_chart(df: pd.DataFrame, spot_price: float,
 
     fig.update_layout(
         title=f'🌊 {symbol} VANNA Exposure — Dealer Delta Sensitivity to IV',
-        xaxis_title=f'Net VANNA ({unit_label})',
-        yaxis_title='Strike Price (USD)',
-        height=600, template='plotly_dark',
-        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(title=f'Net VANNA ({unit_label})',
+                   zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
+                   gridcolor='rgba(128,128,128,0.15)'),
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
+        height=650, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.9)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(family='JetBrains Mono', color='#f1f5f9'),
     )
     return fig
@@ -2193,7 +2269,11 @@ def create_vanna_chart(df: pd.DataFrame, spot_price: float,
 def create_oi_chart(df: pd.DataFrame, spot_price: float,
                     symbol: str = 'BTC') -> go.Figure:
     """OI distribution chart."""
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price, pct=0.25).sort_values('strike').reset_index(drop=True)
+    for col in ['call_oi','put_oi']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
     fig = go.Figure()
     fig.add_trace(go.Bar(
         y=df_s['strike'], x=df_s['call_oi'], orientation='h',
@@ -2228,19 +2308,16 @@ def create_enhanced_vanna_overlay_chart(df: pd.DataFrame, spot_price: float,
     + VANNA flip zones (Vacuum, Support, Trap Door, Resistance)
     + Spot line + IV regime annotation
     """
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
+    for col in ['net_vanna','call_vanna','put_vanna','call_oi','put_oi',
+                'call_iv','put_iv','call_volume','put_volume','total_volume']:
+        if col not in df_s.columns:
+            df_s[col] = 0.0
+        df_s[col] = df_s[col].fillna(0)
     vanna_zones = identify_vanna_flip_zones(df_s, spot_price)
-    iv_df       = compute_iv_trend(df)
-    iv_regime   = 'FLAT'
-    iv_skew     = 0.0
-    if not iv_df.empty and 'iv_regime' in iv_df.columns:
-        last       = iv_df.iloc[-1]
-        iv_regime  = str(last.get('iv_regime', 'FLAT'))
-        iv_skew    = float(last.get('iv_skew', 0.0))
-
-    iv_color = {'EXPANDING':'#ef4444','COMPRESSING':'#10b981','FLAT':'#94a3b8'}.get(iv_regime,'#94a3b8')
+    iv_regime, iv_skew, iv_color = _safe_iv_regime(df)
     max_orig  = df_s['net_vanna'].abs().max() or 1
-    max_enh   = df_s['enhanced_oi_gex'].abs().max() or 1  # proxy for enhanced vanna
+    max_enh   = df_s.get('enhanced_oi_gex', pd.Series([0])).abs().max() or 1  # proxy for enhanced vanna
 
     # Compute Enhanced OI VANNA (similar to India dashboard)
     dist     = (df_s['strike'] - spot_price).abs()
@@ -2297,19 +2374,25 @@ def create_enhanced_vanna_overlay_chart(df: pd.DataFrame, spot_price: float,
         hovertemplate='Strike: %{y:,.0f}<br>Enh VANNA: %{x:.4f}' + unit_label + '<extra></extra>',
     ))
 
-    # Volume overlay — call volume (green, right axis)
+    # Volume overlay — scaled to same axis as VANNA (correct for horizontal bars)
     if 'call_volume' in df_s.columns:
+        max_vol_v = max(float(df_s['call_volume'].max()), float(df_s['put_volume'].max()), 1)
+        vol_scale_v = max_orig * 0.4 / max_vol_v
         fig.add_trace(go.Bar(
-            y=df_s['strike'], x=df_s['call_volume'].fillna(0),
+            y=df_s['strike'], x=df_s['call_volume'].fillna(0) * vol_scale_v,
             orientation='h', name='Call Volume',
             marker=dict(color='rgba(16,185,129,0.18)', line=dict(width=0)),
-            xaxis='x2', showlegend=True,
+            showlegend=True,
+            hovertemplate='Strike: %{y:,.0f}<br>Call Vol: %{customdata:,.0f}<extra></extra>',
+            customdata=df_s['call_volume'].fillna(0),
         ))
         fig.add_trace(go.Bar(
-            y=df_s['strike'], x=df_s['put_volume'].fillna(0),
+            y=df_s['strike'], x=-df_s['put_volume'].fillna(0) * vol_scale_v,
             orientation='h', name='Put Volume',
             marker=dict(color='rgba(239,68,68,0.18)', line=dict(width=0)),
-            xaxis='x2', showlegend=True,
+            showlegend=True,
+            hovertemplate='Strike: %{y:,.0f}<br>Put Vol: %{customdata:,.0f}<extra></extra>',
+            customdata=df_s['put_volume'].fillna(0),
         ))
 
     # Spot line
@@ -2331,38 +2414,28 @@ def create_enhanced_vanna_overlay_chart(df: pd.DataFrame, spot_price: float,
             annotation_position='right',
         )
 
-    max_vol = max(df_s['call_volume'].max() if 'call_volume' in df_s.columns else 1, 1)
     fig.update_layout(
         title=(
             f'🌊 {symbol} Enhanced VANNA Overlay | '
             f'IV: <span style="color:{iv_color}">{iv_regime}</span> | '
             f'Skew: {iv_skew:+.1f}%'
         ),
-        xaxis=dict(title=f'Net VANNA ({unit_label})', zeroline=True,
-                   zerolinecolor='#475569', zerolinewidth=1),
-        xaxis2=dict(overlaying='x', side='top', title='Volume',
-                    range=[0, max_vol * 5], showgrid=False,
-                    tickfont=dict(size=9, color='rgba(148,163,184,0.5)'),
-                    title_font=dict(size=10, color='rgba(148,163,184,0.5)')),
-        yaxis_title='Strike Price (USD)',
-        barmode='overlay',
-        height=700, template='plotly_dark',
-        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        xaxis=dict(title=f'VANNA ({unit_label}) / Volume (scaled)',
+                   zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
+                   gridcolor='rgba(128,128,128,0.15)'),
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
+        barmode='overlay', bargap=0.10,
+        height=720, template='plotly_dark',
+        plot_bgcolor='rgba(15,23,42,0.9)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(family='JetBrains Mono', color='#f1f5f9'),
         legend=dict(
             x=0.01, y=0.99, bgcolor='rgba(15,23,42,0.7)',
-            bordercolor='#2d3748', borderwidth=1,
-            font=dict(size=10),
+            bordercolor='#2d3748', borderwidth=1, font=dict(size=10),
         ),
         annotations=[dict(
             x=0.01, y=0.01, xref='paper', yref='paper',
-            text=(
-                'Cyan/Teal = All VANNA effects | '
-                'Pink/Magenta = OI &Delta; with Vol+IV+Distance+VANNA | '
-                '&#x1F7E9;&#x1F7E5; = Volume'
-            ),
-            font=dict(size=9, color='#64748b'),
-            showarrow=False,
+            text='Cyan/Teal = All VANNA | Pink/Magenta = OI-weighted VANNA | Faint = Volume overlay (scaled)',
+            font=dict(size=9, color='#64748b'), showarrow=False,
         )],
     )
     return fig
@@ -2377,7 +2450,7 @@ def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float
     """
     cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
     emoj = cfg['emoji']
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
 
     for col in ['net_gex', 'enhanced_oi_gex', 'call_volume', 'put_volume', 'total_volume']:
         if col not in df_s.columns:
@@ -2414,54 +2487,60 @@ def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float
         width=0.4,
     ))
 
-    # Volume overlay (right axis x2)
-    max_vol = max(df_s['call_volume'].max(), df_s['put_volume'].max(), 1)
-    fig.add_trace(go.Bar(
-        y=df_s['strike'], x=df_s['call_volume'].fillna(0),
-        orientation='h', name='Call Volume',
-        marker=dict(color='rgba(16,185,129,0.18)', line=dict(width=0)),
-        xaxis='x2', showlegend=True,
-    ))
-    fig.add_trace(go.Bar(
-        y=df_s['strike'], x=df_s['put_volume'].fillna(0),
-        orientation='h', name='Put Volume',
-        marker=dict(color='rgba(239,68,68,0.18)', line=dict(width=0)),
-        xaxis='x2', showlegend=True,
-    ))
+    # Volume overlay as semi-transparent scatter lines on secondary x-axis
+    # For horizontal bar charts, we overlay volume as thin bars scaled to GEX range
+    if 'call_volume' in df_s.columns and 'put_volume' in df_s.columns:
+        max_vol  = max(float(df_s['call_volume'].max()), float(df_s['put_volume'].max()), 1)
+        max_gex2 = max(df_s['net_gex'].abs().max(), df_s['enhanced_oi_gex'].abs().max(), 1)
+        vol_scale = max_gex2 * 0.5 / max_vol  # scale vol to 50% of gex range
+        cv_scaled = df_s['call_volume'].fillna(0) * vol_scale
+        pv_scaled = df_s['put_volume'].fillna(0)  * vol_scale
+        fig.add_trace(go.Bar(
+            y=df_s['strike'], x=cv_scaled,
+            orientation='h', name='Call Vol (scaled)',
+            marker=dict(color='rgba(16,185,129,0.20)', line=dict(width=0)),
+            showlegend=True,
+            hovertemplate='Strike: %{y:,.0f}<br>Call Vol: %{customdata:,.0f}<extra></extra>',
+            customdata=df_s['call_volume'].fillna(0),
+        ))
+        fig.add_trace(go.Bar(
+            y=df_s['strike'], x=-pv_scaled,
+            orientation='h', name='Put Vol (scaled)',
+            marker=dict(color='rgba(239,68,68,0.20)', line=dict(width=0)),
+            showlegend=True,
+            hovertemplate='Strike: %{y:,.0f}<br>Put Vol: %{customdata:,.0f}<extra></extra>',
+            customdata=df_s['put_volume'].fillna(0),
+        ))
 
     # Spot line
     fig.add_hline(y=spot_price,
                   line=dict(color='#fbbf24', width=2.5, dash='dash'),
                   annotation_text=f'Spot: {spot_price:,.2f}',
-                  annotation_font=dict(color='#fbbf24', size=12))
+                  annotation_font=dict(color='#fbbf24', size=12),
+                  annotation_position='right')
 
     # GEX flip zones
     for fz in flip_zones[:5]:
         fig.add_hline(y=fz['strike'],
                       line=dict(color=fz['color'], width=1.5, dash='dot'),
                       annotation_text=f"Flip {fz['arrow']} {fz['strike']:,.0f}",
-                      annotation_font=dict(color=fz['color'], size=10))
+                      annotation_font=dict(color=fz['color'], size=10),
+                      annotation_position='right')
 
     fig.update_layout(
         title=(
             f'{emoj} {symbol} Enhanced GEX Overlay — '
-            f'Green/Red = Standard GEX | Purple/Gold = Enhanced OI GEX'
+            f'Green/Red = Standard GEX | Purple/Gold = Enhanced OI GEX | Faint = Volume'
         ),
         xaxis=dict(
-            title=f'Net GEX ({unit_label})',
+            title=f'GEX ({unit_label})  /  Volume (scaled)',
             zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
-            gridcolor='rgba(128,128,128,0.2)',
+            gridcolor='rgba(128,128,128,0.15)',
         ),
-        xaxis2=dict(
-            overlaying='x', side='top', title='Volume',
-            range=[0, max_vol * 5], showgrid=False,
-            tickfont=dict(size=9, color='rgba(148,163,184,0.5)'),
-            title_font=dict(size=10, color='rgba(148,163,184,0.5)'),
-        ),
-        yaxis_title='Strike Price (USD)',
-        barmode='overlay', bargap=0.15,
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
+        barmode='overlay', bargap=0.10,
         height=700, template='plotly_dark',
-        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(15,23,42,0.9)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(family='JetBrains Mono', color='#f1f5f9'),
         legend=dict(
             orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1,
@@ -2470,8 +2549,7 @@ def create_enhanced_gex_overlay_chart_crypto(df: pd.DataFrame, spot_price: float
         ),
         annotations=[dict(
             x=0.01, y=0.01, xref='paper', yref='paper',
-            text='Green/Red (transparent) = Total accumulated OI GEX &nbsp;|&nbsp; '
-                 'Purple/Gold (opaque) = Fresh OI change &times; Greeks &times; Vol &times; IV',
+            text='Green/Red (semi) = Standard GEX &nbsp;|&nbsp; Purple/Gold (solid) = Enhanced OI GEX &nbsp;|&nbsp; Faint = Volume overlay',
             font=dict(size=9, color='#64748b'), showarrow=False,
         )],
     )
@@ -2487,9 +2565,9 @@ def create_standard_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
     """
     cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
     emoj = cfg['emoji']
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
 
-    for col in ['call_vanna', 'put_vanna']:
+    for col in ['call_vanna', 'put_vanna', 'net_vanna']:
         if col not in df_s.columns:
             df_s[col] = 0.0
         df_s[col] = df_s[col].fillna(0)
@@ -2566,7 +2644,7 @@ def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
     """
     cfg  = CRYPTO_CONFIG.get(symbol, CRYPTO_CONFIG['BTC'])
     emoj = cfg['emoji']
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price).sort_values('strike').reset_index(drop=True)
 
     for col in ['call_vanna','put_vanna','net_vanna','call_iv','put_iv',
                 'call_oi','put_oi','total_volume','call_volume','put_volume']:
@@ -2600,13 +2678,7 @@ def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
 
     max_enh_v   = enh_vanna.abs().max() or 1
     vanna_zones = identify_vanna_flip_zones(df_s, spot_price)
-    iv_df       = compute_iv_trend(df_s)
-    iv_regime   = 'FLAT'
-    iv_skew     = 0.0
-    if not iv_df.empty and 'iv_regime' in iv_df.columns:
-        iv_regime = str(iv_df.iloc[-1]['iv_regime'])
-        iv_skew   = float(iv_df.iloc[-1].get('iv_skew', 0.0))
-    iv_color = {'EXPANDING':'#ef4444','COMPRESSING':'#10b981','FLAT':'#94a3b8'}.get(iv_regime,'#94a3b8')
+    iv_regime, iv_skew, iv_color = _safe_iv_regime(df)
 
     role_colors = {
         'RESISTANCE_CEILING': '#ef4444',
@@ -2633,19 +2705,22 @@ def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
         hovertemplate='Strike: %{y:,.0f}<br>Enh OI VANNA: %{x:.4f}' + unit_label + '<extra></extra>',
     ))
 
-    # Volume overlay
-    max_vol = max(df_s['call_volume'].max(), df_s['put_volume'].max(), 1)
+    # Volume overlay — scaled to main axis (correct for horizontal bars)
+    max_vol_ov = max(float(df_s['call_volume'].max()), float(df_s['put_volume'].max()), 1)
+    vol_scale_ov = max_enh_v * 0.35 / max_vol_ov
     fig.add_trace(go.Bar(
-        y=df_s['strike'], x=df_s['call_volume'],
+        y=df_s['strike'], x=df_s['call_volume'] * vol_scale_ov,
         orientation='h', name='Call Vol',
         marker=dict(color='rgba(16,185,129,0.15)', line=dict(width=0)),
-        xaxis='x2',
+        hovertemplate='Strike: %{y:,.0f}<br>Call Vol: %{customdata:,.0f}<extra></extra>',
+        customdata=df_s['call_volume'],
     ))
     fig.add_trace(go.Bar(
-        y=df_s['strike'], x=df_s['put_volume'],
+        y=df_s['strike'], x=-df_s['put_volume'] * vol_scale_ov,
         orientation='h', name='Put Vol',
         marker=dict(color='rgba(239,68,68,0.15)', line=dict(width=0)),
-        xaxis='x2',
+        hovertemplate='Strike: %{y:,.0f}<br>Put Vol: %{customdata:,.0f}<extra></extra>',
+        customdata=df_s['put_volume'],
     ))
 
     # Spot line
@@ -2679,16 +2754,13 @@ def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
             zeroline=True, zerolinecolor='rgba(255,255,255,0.25)', zerolinewidth=2,
             gridcolor='rgba(128,128,128,0.2)',
         ),
-        xaxis2=dict(
-            overlaying='x', side='top', title='Volume',
-            range=[0, max_vol * 5], showgrid=False,
-            tickfont=dict(size=9, color='rgba(148,163,184,0.5)'),
-            title_font=dict(size=10, color='rgba(148,163,184,0.5)'),
-        ),
-        yaxis_title='Strike Price (USD)',
-        barmode='overlay',
+        yaxis=dict(title='Strike Price (USD)', gridcolor='rgba(128,128,128,0.15)'),
+        xaxis=dict(title=f'Enhanced OI VANNA ({unit_label}) / Volume (scaled)',
+                   zeroline=True, zerolinecolor='rgba(255,255,255,0.3)', zerolinewidth=2,
+                   gridcolor='rgba(128,128,128,0.15)'),
+        barmode='overlay', bargap=0.10,
         height=720, template='plotly_dark',
-        plot_bgcolor='rgba(15,23,42,0.8)', paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(15,23,42,0.9)', paper_bgcolor='rgba(0,0,0,0)',
         font=dict(family='JetBrains Mono', color='#f1f5f9'),
         legend=dict(
             x=0.01, y=0.99, bgcolor='rgba(15,23,42,0.7)',
@@ -2701,7 +2773,19 @@ def create_enhanced_oi_vanna_chart_crypto(df: pd.DataFrame, spot_price: float,
 def create_iv_smile_chart(df: pd.DataFrame, spot_price: float,
                            symbol: str = 'BTC') -> go.Figure:
     """IV Smile / Skew chart — unique to crypto, very informative."""
-    df_s = df.sort_values('strike').reset_index(drop=True)
+    df_s = _filter_strikes_near_spot(df, spot_price, pct=0.35).sort_values('strike').reset_index(drop=True)
+    for col in ['call_iv','put_iv']:
+        if col not in df_s.columns:
+            df_s[col] = 65.0
+        df_s[col] = df_s[col].fillna(65.0)
+    # Remove rows where IV is exactly 0 (no market data)
+    df_s = df_s[(df_s['call_iv'] > 0) | (df_s['put_iv'] > 0)]
+    if df_s.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f'IV Smile — No IV data available for {symbol}',
+                          template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)',
+                          font=dict(family='JetBrains Mono', color='#f1f5f9'))
+        return fig
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=df_s['strike'], y=df_s['call_iv'],
@@ -3299,8 +3383,11 @@ def main():
         # Tab 0 — Standard GEX
         with tabs[0]:
             st.markdown(f"### 🎯 {currency} Standard Gamma Exposure")
-            st.plotly_chart(create_gex_chart(df, spot_price, unit_label, currency),
-                            use_container_width=True)
+            try:
+                st.plotly_chart(create_gex_chart(df, spot_price, unit_label, currency),
+                                use_container_width=True)
+            except Exception as _e0:
+                st.error(f"GEX chart error: {_e0}")
             c1, c2, c3 = st.columns(3)
             c1.metric("Positive GEX", f"{df[df['net_gex']>0]['net_gex'].sum():.4f}{unit_label}")
             c2.metric("Negative GEX", f"{df[df['net_gex']<0]['net_gex'].sum():.4f}{unit_label}")
@@ -3309,7 +3396,9 @@ def main():
         # Tab 1 — Enhanced GEX Overlay
         with tabs[1]:
             st.markdown(f"### \U0001f680 {currency} Enhanced GEX Overlay")
-            st.caption("Green/Red (transparent) = Standard GEX total OI | Purple/Gold (opaque) = Enhanced OI GEX fresh positioning")
+            st.caption("Green/Red (transparent) = Standard GEX total OI | Purple/Gold (opaque) = Enhanced OI GEX fresh positioning | Faint = Volume overlay")
+            if 'enhanced_oi_gex' not in df.columns:
+                df = _compute_enhanced_oi_gex_crypto(df, spot_price, unit_label)
             st.plotly_chart(
                 create_enhanced_gex_overlay_chart_crypto(df, spot_price, unit_label, currency),
                 use_container_width=True)
@@ -3325,8 +3414,11 @@ def main():
             st.caption("OI-weighted GEX incorporating Greeks · Volume · IV · Distance. Purple = Positive, Gold = Negative.")
             if 'enhanced_oi_gex' not in df.columns:
                 df = _compute_enhanced_oi_gex_crypto(df, spot_price, unit_label)
-            st.plotly_chart(create_enhanced_oi_gex_chart(df, spot_price, unit_label, currency),
-                            use_container_width=True)
+            try:
+                st.plotly_chart(create_enhanced_oi_gex_chart(df, spot_price, unit_label, currency),
+                                use_container_width=True)
+            except Exception as _e2:
+                st.error(f"Enhanced OI GEX chart error: {_e2}")
             g1, g2, g3 = st.columns(3)
             g1.metric("🟣 Positive OI GEX", f"{df['enhanced_oi_gex'].clip(lower=0).sum():.4f}{unit_label}")
             g2.metric("🟡 Negative OI GEX", f"{df['enhanced_oi_gex'].clip(upper=0).sum():.4f}{unit_label}")
@@ -3340,9 +3432,12 @@ def main():
             <b>Positive VANNA</b> = IV rises, dealer BUYS delta (bullish force)<br>
             <b>Negative VANNA</b> = IV rises, dealer SELLS delta (bearish force)
             </div>""", unsafe_allow_html=True)
-            st.plotly_chart(
-                create_standard_vanna_chart_crypto(df, spot_price, unit_label, currency),
-                use_container_width=True)
+            try:
+                st.plotly_chart(
+                    create_standard_vanna_chart_crypto(df, spot_price, unit_label, currency),
+                    use_container_width=True)
+            except Exception as _e3:
+                st.error(f"VANNA chart error: {_e3}")
             sv1, sv2, sv3 = st.columns(3)
             sv1.metric("Call VANNA", f"{df['call_vanna'].sum():.6f}{unit_label}" if 'call_vanna' in df.columns else "N/A")
             sv2.metric("Put VANNA",  f"{df['put_vanna'].sum():.6f}{unit_label}"  if 'put_vanna'  in df.columns else "N/A")
@@ -3362,9 +3457,16 @@ def main():
             </div>""", unsafe_allow_html=True)
 
             # Enhanced VANNA Overlay — same as India dashboard Tab 5
-            enh_vanna_fig = create_enhanced_vanna_overlay_chart(
-                df, spot_price, unit_label, currency)
-            st.plotly_chart(enh_vanna_fig, use_container_width=True)
+            try:
+                if 'enhanced_oi_gex' not in df.columns:
+                    df = _compute_enhanced_oi_gex_crypto(df, spot_price, unit_label)
+                enh_vanna_fig = create_enhanced_vanna_overlay_chart(
+                    df, spot_price, unit_label, currency)
+                st.plotly_chart(enh_vanna_fig, use_container_width=True)
+            except Exception as _ev_err:
+                st.warning(f"Enhanced VANNA overlay: {_ev_err}. Showing standard VANNA.")
+                st.plotly_chart(create_vanna_chart(df, spot_price, unit_label, currency),
+                                use_container_width=True)
 
             # VANNA zone metrics
             vanna_zones = identify_vanna_flip_zones(df, spot_price)
@@ -3439,9 +3541,12 @@ def main():
             \u26a0\ufe0f <b style="color:#f59e0b">Trap Door</b> = POS to NEG flip below spot<br>
             \U0001f6e1 <b style="color:#06b6d4">Support Floor</b> = NEG to POS flip below spot
             </div>""", unsafe_allow_html=True)
-            st.plotly_chart(
-                create_enhanced_oi_vanna_chart_crypto(df, spot_price, unit_label, currency),
-                use_container_width=True)
+            try:
+                st.plotly_chart(
+                    create_enhanced_oi_vanna_chart_crypto(df, spot_price, unit_label, currency),
+                    use_container_width=True)
+            except Exception as _e5:
+                st.error(f"Enhanced OI VANNA chart error: {_e5}")
             vzones5 = identify_vanna_flip_zones(df, spot_price)
             ev1, ev2, ev3, ev4, ev5 = st.columns(5)
             ev1.metric("Total Zones",   len(vzones5))
@@ -3465,12 +3570,7 @@ def main():
             )
 
             vanna_zones  = identify_vanna_flip_zones(df, spot_price)
-            iv_df        = compute_iv_trend(df)
-            iv_regime    = 'FLAT'
-            if not iv_df.empty and 'iv_regime' in iv_df.columns:
-                iv_regime = str(iv_df.iloc[-1]['iv_regime'])
-
-            iv_color = {'EXPANDING':'#ef4444','COMPRESSING':'#10b981','FLAT':'#94a3b8'}.get(iv_regime,'#94a3b8')
+            iv_regime, _iv_skew_cas, iv_color = _safe_iv_regime(df)
             st.markdown(
                 '<div style="background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.3);'
                 'padding:10px 14px;border-radius:6px;font-size:0.82rem;margin-bottom:12px;">'
@@ -3556,8 +3656,11 @@ def main():
             📉 <b>Reverse Skew</b> = Put IV &gt; Call IV → Market pricing downside risk (bearish hedge demand)<br>
             🏔️ <b>IV Smile peak</b> = ATM has lowest IV, OTM higher → normal crypto structure
             </div>""", unsafe_allow_html=True)
-            st.plotly_chart(create_iv_smile_chart(df, spot_price, currency),
-                            use_container_width=True)
+            try:
+                _iv_smile_fig = create_iv_smile_chart(df, spot_price, currency)
+                st.plotly_chart(_iv_smile_fig, use_container_width=True)
+            except Exception as _e7:
+                st.error(f"IV Smile chart error: {_e7}")
             avg_call_iv = df['call_iv'].mean()
             avg_put_iv  = df['put_iv'].mean()
             skew        = avg_call_iv - avg_put_iv
@@ -3571,8 +3674,10 @@ def main():
         # Tab 8 — OI Distribution
         with tabs[8]:
             st.markdown(f"### 📋 {currency} Open Interest Distribution")
-            st.plotly_chart(create_oi_chart(df, spot_price, currency),
-                            use_container_width=True)
+            try:
+                st.plotly_chart(create_oi_chart(df, spot_price, currency), use_container_width=True)
+            except Exception as _e8:
+                st.error(f"OI chart error: {_e8}")
             max_pain = df.loc[(df['call_oi'] + df['put_oi']).idxmax(), 'strike']
             o1, o2, o3, o4 = st.columns(4)
             o1.metric("Total Call OI",  f"{df['call_oi'].sum():,.0f}")
@@ -3753,7 +3858,10 @@ def main():
                 st.markdown(f"#### 📈 {hist_metric.upper()} Evolution Over Time")
                 evo_fig = create_historical_gex_chart(
                     hist_df, hist_metric, currency, unit_label)
-                st.plotly_chart(evo_fig, use_container_width=True)
+                try:
+                    st.plotly_chart(evo_fig, use_container_width=True)
+                except Exception as _ehg:
+                    st.error(f"Historical GEX chart: {_ehg}")
 
                 # ── Heatmap ───────────────────────────────────────────────
                 st.markdown(f"#### 🔥 Strike × Time Heatmap — {hist_metric.upper()}")
